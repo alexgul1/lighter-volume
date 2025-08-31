@@ -172,6 +172,10 @@ class TradingEngine:
 
             logger.info(f"📊 Batch trade {token}: ${amount_usdc} USDC")
 
+            # Calculate order expiry (10 minutes from now)
+            import time
+            order_expiry = int(time.time()) + 600  # Current timestamp + 10 minutes
+
             # Sign buy order (market order with max slippage)
             buy_tx_info, buy_err = self.client.sign_create_order(
                 market_index=market_index,
@@ -183,6 +187,7 @@ class TradingEngine:
                 time_in_force=self.client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
                 reduce_only=False,
                 trigger_price=0,
+                order_expiry=order_expiry,  # Add order expiry
                 nonce=nonces[0]
             )
 
@@ -201,6 +206,7 @@ class TradingEngine:
                 time_in_force=self.client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
                 reduce_only=False,
                 trigger_price=0,
+                order_expiry=order_expiry,  # Add order expiry
                 nonce=nonces[1]
             )
 
