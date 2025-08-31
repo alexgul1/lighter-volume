@@ -172,22 +172,19 @@ class TradingEngine:
 
             logger.info(f"📊 Batch trade {token}: ${amount_usdc} USDC")
 
-            # Calculate order expiry (10 minutes from now in milliseconds)
-            import time
-            order_expiry = int((time.time() + 600) * 1000)  # Convert to milliseconds
-
+            # For market orders with IOC, use DEFAULT_IOC_EXPIRY = 0
             # Sign buy order (market order with max slippage)
             buy_tx_info, buy_err = self.client.sign_create_order(
                 market_index=market_index,
                 client_order_index=order_indices[0],
                 base_amount=base_amount,
                 price=Config.MAX_BUY_PRICE,  # Max price for market buy
-                is_ask=False,  # Buy
+                is_ask=False,  # False = BUY order
                 order_type=self.client.ORDER_TYPE_MARKET,
                 time_in_force=self.client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
                 reduce_only=False,
                 trigger_price=0,
-                order_expiry=order_expiry,  # Order expiry in milliseconds
+                order_expiry=0,  # Use 0 for IOC market orders
                 nonce=nonces[0]
             )
 
@@ -201,12 +198,12 @@ class TradingEngine:
                 client_order_index=order_indices[1],
                 base_amount=base_amount,
                 price=Config.MIN_SELL_PRICE,  # Min price for market sell
-                is_ask=True,  # Sell
+                is_ask=True,  # True = SELL order
                 order_type=self.client.ORDER_TYPE_MARKET,
                 time_in_force=self.client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
                 reduce_only=False,
                 trigger_price=0,
-                order_expiry=order_expiry,  # Order expiry in milliseconds
+                order_expiry=0,  # Use 0 for IOC market orders
                 nonce=nonces[1]
             )
 
