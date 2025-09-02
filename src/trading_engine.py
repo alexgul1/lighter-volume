@@ -1,7 +1,8 @@
 import asyncio
 import random
 import time
-from typing import Set, Dict, Optional, Tuple
+import uuid
+from typing import Set, Dict, Optional, Tuple, List
 import lighter
 
 from src.config import Config
@@ -11,10 +12,28 @@ from src.utils import setup_logger, Stats
 logger = setup_logger(__name__, Config.LOG_LEVEL)
 
 
+class Position:
+    """Represents a single position"""
+
+    def __init__(self, position_id: str, token: str, position_type: str,
+                 is_long: bool, base_amount: int, amount_usdc: float,
+                 open_order_index: int, open_tx_id: int):
+        self.position_id = position_id
+        self.token = token
+        self.position_type = position_type
+        self.is_long = is_long
+        self.base_amount = base_amount
+        self.amount_usdc = amount_usdc
+        self.open_order_index = open_order_index
+        self.open_tx_id = open_tx_id
+        self.open_time = time.time()
+        self.is_closing = False  # Flag to prevent double closing
+
+
 class TradingEngine:
     """
     Futures trading engine for Lighter Protocol.
-    Opens and closes long/short positions with proper timing.
+    Supports multiple concurrent positions per token.
     """
 
     def __init__(self, db_manager: DatabaseManager):
@@ -23,8 +42,9 @@ class TradingEngine:
         self.api_client = None
         self.transaction_api = None
 
-        # Trading state
-        self.active_positions: Dict[str, dict] = {}  # token -> position info
+        # Trading state - now supports multiple positions per token
+        self.active_positions: Dict[str, Position] = {}  # position_id -> Position
+        self.positions_by_token: Dict[str, List[str]] = {}  # token -> list of position_ids
         self.running = False
         self.stats = Stats()
 
@@ -69,6 +89,7 @@ class TradingEngine:
 
             logger.info(f"Trading engine initialized (Account type: {Config.ACCOUNT_TYPE})")
             logger.info(f"Default leverage: {Config.DEFAULT_LEVERAGE}x")
+            logger.info(f"Multiple positions per token: ENABLED")
 
         except Exception as e:
             logger.error(f"Failed to initialize: {e}")
@@ -145,10 +166,15 @@ class TradingEngine:
         """Stop trading bot"""
         self.running = False
 
-        # Close any open positions
-        for token, position in self.active_positions.items():
-            logger.info(f"Closing open position for {token}")
-            await self._close_position(token, position)
+        # Close all open positions
+        if self.active_positions:
+            logger.info(f"Closing {len(self.active_positions)} open positions...")
+            close_tasks = []
+            for position_id, position in self.active_positions.items():
+                if not position.is_closing:
+                    close_tasks.append(self._close_position(position_id))
+            if close_tasks:
+                await asyncio.gather(*close_tasks, return_exceptions=True)
 
         logger.info("Trading bot stopped")
         logger.info(self.stats.get_stats_string())
@@ -157,19 +183,10 @@ class TradingEngine:
         """Main trading loop"""
         while self.running:
             try:
-                # Select random token
-                available_tokens = [
-                    token for token in Config.TRADING_TOKENS
-                    if token not in self.active_positions
-                ]
+                # We can now open positions for any token, even if it has existing positions
+                token = random.choice(Config.TRADING_TOKENS)
 
-                if not available_tokens:
-                    await asyncio.sleep(2)
-                    continue
-
-                token = random.choice(available_tokens)
-
-                # Open a position
+                # Open a new position
                 await self._open_position(token)
 
                 # Wait before next trade
@@ -188,6 +205,9 @@ class TradingEngine:
             logger.error(f"Unknown market for token {token}")
             return
 
+        # Generate unique position ID
+        position_id = str(uuid.uuid4())[:8]
+
         # Random position type
         is_long = random.choice([True, False])
         position_type = "long" if is_long else "short"
@@ -198,25 +218,22 @@ class TradingEngine:
             Config.MAX_TRADE_AMOUNT
         ), 2)
 
-        # Calculate base amount (seems to be integer in examples)
-        # From examples: BaseAmount of 11 for ~$10-12 position
-        # This suggests BaseAmount might be position size in dollars or a scaled value
+        # Calculate base amount
         base_amount = int(amount_usdc)
 
         # Calculate price with max slippage
-        # From examples: prices are like 1112032, which is $11,120.32
-        # So price is in cents (multiply by 100)
         if is_long:
-            # For long: buy at any price (high limit)
-            price = 999999999
+            price = 999999999  # Buy at any price
             is_ask = False  # Buy to open long
         else:
-            # For short: sell at any price (low limit)
-            price = 1
+            price = 1  # Sell at any price
             is_ask = True  # Sell to open short
 
         try:
-            logger.info(f"📈 Opening {position_type.upper()} {token}: ${amount_usdc}")
+            # Count active positions for this token
+            token_positions = self.positions_by_token.get(token, [])
+            logger.info(f"📈 Opening {position_type.upper()} {token}: ${amount_usdc} "
+                        f"(ID: {position_id}, Active: {len(token_positions)})")
 
             # Get order index and nonce
             order_index = await self.get_next_order_index()
@@ -261,17 +278,27 @@ class TradingEngine:
             )
             open_tx_id = await self.db.log_transaction(tx)
 
-            # Store position info
-            self.active_positions[token] = {
-                "position_type": position_type,
-                "is_long": is_long,
-                "base_amount": base_amount,
-                "amount_usdc": amount_usdc,
-                "open_tx_id": open_tx_id,
-                "open_time": time.time()
-            }
+            # Create position object
+            position = Position(
+                position_id=position_id,
+                token=token,
+                position_type=position_type,
+                is_long=is_long,
+                base_amount=base_amount,
+                amount_usdc=amount_usdc,
+                open_order_index=order_index,
+                open_tx_id=open_tx_id
+            )
 
-            logger.info(f"✅ Opened {position_type} position for {token}")
+            # Store position
+            self.active_positions[position_id] = position
+
+            # Update positions by token
+            if token not in self.positions_by_token:
+                self.positions_by_token[token] = []
+            self.positions_by_token[token].append(position_id)
+
+            logger.info(f"✅ Opened {position_type} {token} (ID: {position_id})")
             self.stats.add_position(True, amount_usdc, is_long)
 
             # Schedule position close
@@ -279,7 +306,7 @@ class TradingEngine:
                 Config.POSITION_HOLD_TIME_MIN,
                 Config.POSITION_HOLD_TIME_MAX
             )
-            asyncio.create_task(self._schedule_close_position(token, hold_time))
+            asyncio.create_task(self._schedule_close_position(position_id, hold_time))
 
         except Exception as e:
             logger.error(f"Failed to open position for {token}: {e}")
@@ -297,40 +324,37 @@ class TradingEngine:
             )
             await self.db.log_transaction(tx)
 
-    async def _schedule_close_position(self, token: str, hold_time: float):
-        """Schedule closing a position after hold time"""
+    async def _schedule_close_position(self, position_id: str, hold_time: float):
+        """Schedule closing a specific position after hold time"""
         await asyncio.sleep(hold_time)
+        await self._close_position(position_id)
 
-        position = self.active_positions.get(token)
-        if position:
-            await self._close_position(token, position)
+    async def _close_position(self, position_id: str):
+        """Close a specific position by ID"""
 
-    async def _close_position(self, token: str, position: dict):
-        """Close an open position"""
+        position = self.active_positions.get(position_id)
+        if not position or position.is_closing:
+            return
+
+        # Mark as closing to prevent double closing
+        position.is_closing = True
 
         # Get market index
-        market_index = Config.MARKET_INDICES.get(token)
+        market_index = Config.MARKET_INDICES.get(position.token)
         if market_index is None:
             return
 
-        is_long = position["is_long"]
-        position_type = position["position_type"]
-        base_amount = position["base_amount"]
-        amount_usdc = position["amount_usdc"]
-        open_tx_id = position["open_tx_id"]
-
         # For closing: reverse the side
-        if is_long:
-            # Close long: sell
+        if position.is_long:
             price = 1  # Sell at any price
             is_ask = True
         else:
-            # Close short: buy
             price = 999999999  # Buy at any price
             is_ask = False
 
         try:
-            logger.info(f"📉 Closing {position_type.upper()} {token}")
+            logger.info(f"📉 Closing {position.position_type.upper()} {position.token} "
+                        f"(ID: {position_id})")
 
             # Get order index and nonce
             order_index = await self.get_next_order_index()
@@ -340,7 +364,7 @@ class TradingEngine:
             tx_info, error = self.client.sign_create_order(
                 market_index=market_index,
                 client_order_index=order_index,
-                base_amount=base_amount,
+                base_amount=position.base_amount,
                 price=price,
                 is_ask=is_ask,
                 order_type=self.client.ORDER_TYPE_MARKET,
@@ -353,6 +377,7 @@ class TradingEngine:
 
             if error:
                 logger.error(f"Failed to sign close order: {error}")
+                position.is_closing = False  # Reset flag on error
                 return
 
             # Send transaction
@@ -364,37 +389,48 @@ class TradingEngine:
             # Log transaction
             tx = Transaction(
                 tx_type="close",
-                position_type=position_type,
-                token=token,
-                amount_usdc=amount_usdc,
-                base_amount=base_amount,
+                position_type=position.position_type,
+                token=position.token,
+                amount_usdc=position.amount_usdc,
+                base_amount=position.base_amount,
                 price=price,
                 is_success=True,
-                dependency=open_tx_id,
+                dependency=position.open_tx_id,
                 order_id=str(order_index),
                 tx_hash=str(result) if result else None
             )
             await self.db.log_transaction(tx)
 
             # Remove from active positions
-            del self.active_positions[token]
+            del self.active_positions[position_id]
 
-            logger.info(f"✅ Closed {position_type} position for {token}")
+            # Remove from positions by token
+            if position.token in self.positions_by_token:
+                self.positions_by_token[position.token].remove(position_id)
+                if not self.positions_by_token[position.token]:
+                    del self.positions_by_token[position.token]
+
+            # Count remaining positions for this token
+            remaining = len(self.positions_by_token.get(position.token, []))
+
+            logger.info(f"✅ Closed {position.position_type} {position.token} "
+                        f"(ID: {position_id}, Remaining: {remaining})")
             logger.info(self.stats.get_stats_string())
 
         except Exception as e:
-            logger.error(f"Failed to close position for {token}: {e}")
+            logger.error(f"Failed to close position {position_id}: {e}")
+            position.is_closing = False  # Reset flag on error
 
             # Log failed transaction
             tx = Transaction(
                 tx_type="close",
-                position_type=position_type,
-                token=token,
-                amount_usdc=amount_usdc,
-                base_amount=base_amount,
+                position_type=position.position_type,
+                token=position.token,
+                amount_usdc=position.amount_usdc,
+                base_amount=position.base_amount,
                 price=price,
                 is_success=False,
-                dependency=open_tx_id,
+                dependency=position.open_tx_id,
                 error=str(e)
             )
             await self.db.log_transaction(tx)
