@@ -1,49 +1,40 @@
-# Lighter Trading Bot - Maximum Efficiency Edition
+# Lighter Futures Trading Bot
 
-Optimized trading bot for Lighter Protocol's zero-fee beta on standard accounts. Maximizes swap frequency while respecting strict API limits.
+Automated futures trading bot for Lighter Protocol. Opens and closes long/short positions to maximize volume during the zero-fee beta period.
 
-## ⚡ Key Features
+## Key Features
 
-- **Maximum Efficiency**: Batch transactions (buy+sell in single API call)
-- **Zero API Waste**: No price checks, no balance queries, minimal API usage
-- **Standard Account Optimized**: ~9 swaps/minute (18 trades) on standard account
-- **Premium Account Ready**: Can switch to premium for 4000+ swaps/minute
-- **100% Slippage Tolerance**: Trades execute at any price (high liquidity tokens only)
-- **MongoDB Logging**: Full audit trail of all transactions
-- **Docker Ready**: Easy deployment with docker-compose
+- **Futures Trading**: Opens both LONG and SHORT positions randomly
+- **Automatic Position Management**: Opens positions and closes them after 2-5 seconds
+- **Leverage Control**: Sets configurable leverage (default 3x) at startup
+- **Smart Timing**: Configurable delays between trades and position hold times
+- **MongoDB Logging**: Complete audit trail of all positions
+- **Zero Fees**: Optimized for standard accounts with 0% fees during beta
 
-## 🚀 Performance
+## How It Works
 
-### Standard Account (60 weighted requests/minute)
-- **Max theoretical**: 10 batches/minute (20 trades)
-- **Safe operation**: 9 batches/minute (18 trades)
-- **Daily volume**: ~25,920 trades
+1. **Set Leverage**: On startup, sets leverage for all configured markets
+2. **Open Position**: Randomly selects token and direction (long/short)
+3. **Hold Position**: Waits 2-5 seconds (configurable)
+4. **Close Position**: Automatically closes with opposite order
+5. **Repeat**: Waits configured delay, then opens next position
 
-### Premium Account (24,000 weighted requests/minute)  
-- **Max theoretical**: 4,000 batches/minute (8,000 trades)
-- **Safe operation**: 3,600 batches/minute (7,200 trades)
-- **Daily volume**: ~10,368,000 trades
+## Configuration (.env)
 
-## ⚠️ Risk Disclaimer
+```env
+# API Keys (REQUIRED)
+LIGHTER_API_KEY_PRIVATE_KEY=your_api_key_here
+LIGHTER_ETH_PRIVATE_KEY=your_eth_private_key_here
+LIGHTER_ACCOUNT_INDEX=1
+LIGHTER_API_KEY_INDEX=2
 
-**THIS BOT USES 100% SLIPPAGE TOLERANCE**
-- Trades execute at ANY market price
-- Only use with high liquidity tokens (ETH, BTC, SOL)
-- You WILL experience slippage losses
-- This is designed for beta farming, not profit
-- USE AT YOUR OWN RISK
+# Trading Settings
+MIN_TRADE_AMOUNT_USDC=10.0
+MAX_TRADE_AMOUNT_USDC=50.0
+TRADING_TOKENS=ETH,BTC,SOL
+DEFAULT_LEVERAGE=3
 
-## 📋 Prerequisites
-
-- Python 3.11+
-- MongoDB 7.0+
-- Lighter account with API keys
-- USDC balance for trading
-
-## 🔧 Quick Start
-
-### 1. Clone and Setup
-```bash
-git clone <repository-url>
-cd lighter-trading-bot
-pip install -r requirements.txt
+# Position Timing
+POSITION_HOLD_TIME_MIN=2
+POSITION_HOLD_TIME_MAX=5
+DELAY_BETWEEN_TRADES=3

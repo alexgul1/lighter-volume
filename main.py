@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Lighter Trading Bot - Optimized for Maximum Swaps
+Lighter Futures Trading Bot
 """
 
 import asyncio
@@ -28,8 +28,8 @@ async def main():
 if __name__ == "__main__":
     print("""
     ╔══════════════════════════════════════════════════════════╗
-    ║     LIGHTER TRADING BOT - MAXIMUM EFFICIENCY MODE       ║
-    ║     Zero Fees Beta Farming - Use at Your Own Risk       ║
+    ║          LIGHTER FUTURES TRADING BOT                     ║
+    ║          Points Farming - Zero Fees (Standard)           ║
     ╚══════════════════════════════════════════════════════════╝
     """)
 

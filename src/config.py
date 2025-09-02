@@ -6,7 +6,7 @@ load_dotenv()
 
 
 class Config:
-    """Application configuration optimized for standard accounts"""
+    """Application configuration for futures trading"""
 
     # Lighter API
     BASE_URL = os.getenv("LIGHTER_BASE_URL", "https://mainnet.zklighter.elliot.ai")
@@ -19,15 +19,13 @@ class Config:
     ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "standard").lower()
     IS_PREMIUM = ACCOUNT_TYPE == "premium"
 
-    # API Limits based on account type
-    # Standard: 60 rpm total, but sendTx has weight 6, so max 10 transactions/minute
-    # Premium: 24000 weighted rpm, so max 4000 transactions/minute with weight 6
+    # API Limits
     if IS_PREMIUM:
-        MAX_REQUESTS_PER_MINUTE = 4000  # Premium can do much more
-        SAFE_DELAY_BETWEEN_BATCHES = 0.1  # 100ms between batches
+        MAX_REQUESTS_PER_MINUTE = 4000
+        SAFE_DELAY_BETWEEN_TRADES = 0.5
     else:
         MAX_REQUESTS_PER_MINUTE = 10  # Standard: 60/6 = 10 max
-        SAFE_DELAY_BETWEEN_BATCHES = 6.5  # ~9 requests per minute to be safe
+        SAFE_DELAY_BETWEEN_TRADES = 7  # Safe for standard account
 
     # MongoDB
     MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
@@ -36,22 +34,19 @@ class Config:
 
     # Trading
     MIN_TRADE_AMOUNT = float(os.getenv("MIN_TRADE_AMOUNT_USDC", "10.0"))
-    MAX_TRADE_AMOUNT = float(os.getenv("MAX_TRADE_AMOUNT_USDC", "100.0"))
+    MAX_TRADE_AMOUNT = float(os.getenv("MAX_TRADE_AMOUNT_USDC", "50.0"))
     TRADING_TOKENS: List[str] = os.getenv("TRADING_TOKENS", "ETH,BTC,SOL").split(",")
-    STABLE_COIN = os.getenv("STABLE_COIN", "USDC")
+    DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "3"))
 
-    # Batch Trading (to maximize efficiency)
-    USE_BATCH_ORDERS = os.getenv("USE_BATCH_ORDERS", "true").lower() == "true"
-    BATCH_SIZE = int(os.getenv("BATCH_SIZE", "2"))  # Buy + Sell in one batch
-
-    # Bot Settings (less frequent checks to save API calls)
-    RETRY_FAILED_SELLS_INTERVAL = int(os.getenv("RETRY_FAILED_SELLS_INTERVAL", "120"))
-    CHECK_UNPAIRED_INTERVAL = int(os.getenv("CHECK_UNPAIRED_INTERVAL", "300"))
+    # Position timing
+    POSITION_HOLD_TIME_MIN = float(os.getenv("POSITION_HOLD_TIME_MIN", "2"))
+    POSITION_HOLD_TIME_MAX = float(os.getenv("POSITION_HOLD_TIME_MAX", "5"))
+    DELAY_BETWEEN_TRADES = float(os.getenv("DELAY_BETWEEN_TRADES", "3"))
 
     # Logging
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
-    # Market indices mapping (update based on actual Lighter markets)
+    # Market indices (from Lighter)
     MARKET_INDICES: Dict[str, int] = {
         "ETH": 0,
         "BTC": 1,
@@ -60,13 +55,13 @@ class Config:
         "AVAX": 4,
         "LINK": 5,
         "UNI": 6,
-        "AAVE": 7
+        "AAVE": 7,
+        "HYPE": 24  # Added from your example
     }
 
-    # Maximum slippage prices (essentially infinite for market orders)
-    # For buys: very high price, for sells: very low price
-    MAX_BUY_PRICE = 999999999  # Essentially no limit
-    MIN_SELL_PRICE = 1  # Accept any price
+    # Price scaling (Lighter uses integer prices with 2 decimal places)
+    PRICE_SCALE = 100  # For price conversion
+    BASE_AMOUNT_SCALE = 1  # BaseAmount seems to be in smallest units
 
     @classmethod
     def validate(cls):
@@ -77,4 +72,4 @@ class Config:
             raise ValueError("LIGHTER_ETH_PRIVATE_KEY is required")
         for token in cls.TRADING_TOKENS:
             if token not in cls.MARKET_INDICES:
-                raise ValueError(f"Unknown token: {token}. Please update MARKET_INDICES in config.")
+                raise ValueError(f"Unknown token: {token}")

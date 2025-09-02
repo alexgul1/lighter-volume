@@ -9,18 +9,22 @@ logger = logging.getLogger(__name__)
 
 
 class Transaction:
-    """Transaction model"""
+    """Transaction model for futures trades"""
 
-    def __init__(self, tx_type: str, token: str, amount: float,
+    def __init__(self, tx_type: str, position_type: str, token: str,
+                 amount_usdc: float, base_amount: int, price: int,
                  is_success: bool = False, dependency: Optional[int] = None,
                  order_id: Optional[str] = None, tx_hash: Optional[str] = None,
                  error: Optional[str] = None):
         self.date = datetime.utcnow()
-        self.type = tx_type  # "buy" or "sell"
+        self.type = tx_type  # "open" or "close"
+        self.position_type = position_type  # "long" or "short"
         self.token = token
-        self.amount = amount
+        self.amount_usdc = amount_usdc
+        self.base_amount = base_amount
+        self.price = price
         self.is_success = is_success
-        self.dependency = dependency
+        self.dependency = dependency  # For close, references open txId
         self.order_id = order_id
         self.tx_hash = tx_hash
         self.error = error
@@ -29,8 +33,11 @@ class Transaction:
         return {
             "date": self.date,
             "type": self.type,
+            "position_type": self.position_type,
             "token": self.token,
-            "amount": self.amount,
+            "amount_usdc": self.amount_usdc,
+            "base_amount": self.base_amount,
+            "price": self.price,
             "is_success": self.is_success,
             "dependency": self.dependency,
             "order_id": self.order_id,
@@ -40,7 +47,7 @@ class Transaction:
 
 
 class DatabaseManager:
-    """MongoDB database manager - optimized for minimal queries"""
+    """MongoDB database manager"""
 
     def __init__(self, uri: str, database: str, collection: str):
         self.uri = uri
@@ -59,9 +66,11 @@ class DatabaseManager:
             self.db = self.client[self.database_name]
             self.collection = self.db[self.collection_name]
 
-            # Create minimal indexes
+            # Create indexes
             await self.collection.create_index([("txId", ASCENDING)], unique=True)
             await self.collection.create_index([("date", DESCENDING)])
+            await self.collection.create_index([("type", ASCENDING)])
+            await self.collection.create_index([("position_type", ASCENDING)])
 
             # Initialize counter
             last_tx = await self.collection.find_one(sort=[("txId", -1)])
@@ -93,21 +102,3 @@ class DatabaseManager:
 
         await self.collection.insert_one(doc)
         return tx_id
-
-    async def log_batch_transactions(self, transactions: List[Transaction]) -> List[int]:
-        """Log multiple transactions efficiently"""
-        tx_ids = []
-        docs = []
-
-        async with self._counter_lock:
-            for transaction in transactions:
-                self._tx_counter += 1
-                doc = transaction.to_dict()
-                doc["txId"] = self._tx_counter
-                docs.append(doc)
-                tx_ids.append(self._tx_counter)
-
-        if docs:
-            await self.collection.insert_many(docs)
-
-        return tx_ids

@@ -36,29 +36,36 @@ class Stats:
 
     def __init__(self):
         self.start_time = datetime.now()
-        self.total_trades = 0
-        self.successful_trades = 0
-        self.failed_trades = 0
+        self.total_positions = 0
+        self.successful_positions = 0
+        self.failed_positions = 0
         self.total_volume = 0.0
+        self.long_positions = 0
+        self.short_positions = 0
 
-    def add_trade(self, success: bool, volume: float):
-        """Add trade to statistics"""
-        self.total_trades += 1
+    def add_position(self, success: bool, volume: float, is_long: bool):
+        """Add position to statistics"""
+        self.total_positions += 1
         self.total_volume += volume
-        if success:
-            self.successful_trades += 1
+        if is_long:
+            self.long_positions += 1
         else:
-            self.failed_trades += 1
+            self.short_positions += 1
+        if success:
+            self.successful_positions += 1
+        else:
+            self.failed_positions += 1
 
     def get_stats_string(self) -> str:
         """Get formatted statistics string"""
         runtime = datetime.now() - self.start_time
         hours = runtime.total_seconds() / 3600
-        trades_per_hour = self.total_trades / hours if hours > 0 else 0
+        positions_per_hour = self.total_positions / hours if hours > 0 else 0
 
         return (
-            f"Stats: {self.total_trades} trades "
-            f"({self.successful_trades} success, {self.failed_trades} failed) | "
+            f"📊 Stats: {self.total_positions} positions "
+            f"(L:{self.long_positions} S:{self.short_positions}) | "
+            f"Success: {self.successful_positions} | "
             f"Volume: ${self.total_volume:.2f} | "
-            f"Rate: {trades_per_hour:.1f} trades/hour"
+            f"Rate: {positions_per_hour:.1f}/hour"
         )

@@ -27,12 +27,13 @@ class TradingBot:
 
             # Show configuration
             logger.info("=" * 60)
-            logger.info("LIGHTER TRADING BOT - MAXIMUM EFFICIENCY MODE")
+            logger.info("LIGHTER FUTURES TRADING BOT")
             logger.info("=" * 60)
             logger.info(f"Account Type: {Config.ACCOUNT_TYPE.upper()}")
-            logger.info(f"Max Transactions/Minute: {Config.MAX_REQUESTS_PER_MINUTE}")
-            logger.info(f"Batch Trading: {'ENABLED' if Config.USE_BATCH_ORDERS else 'DISABLED'}")
-            logger.info(f"Delay Between Batches: {Config.SAFE_DELAY_BETWEEN_BATCHES}s")
+            logger.info(f"Leverage: {Config.DEFAULT_LEVERAGE}x")
+            logger.info(f"Tokens: {Config.TRADING_TOKENS}")
+            logger.info(f"Position Size: ${Config.MIN_TRADE_AMOUNT}-${Config.MAX_TRADE_AMOUNT}")
+            logger.info(f"Hold Time: {Config.POSITION_HOLD_TIME_MIN}-{Config.POSITION_HOLD_TIME_MAX}s")
             logger.info("=" * 60)
 
             # Initialize database
