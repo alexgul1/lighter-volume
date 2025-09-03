@@ -6,10 +6,11 @@ load_dotenv()
 
 
 class Config:
-    """Application configuration for futures trading"""
+    """Application configuration for futures trading with TP/SL"""
 
     # Lighter API
     BASE_URL = os.getenv("LIGHTER_BASE_URL", "https://mainnet.zklighter.elliot.ai")
+    WS_URL = os.getenv("LIGHTER_WS_URL", "wss://mainnet.zklighter.elliot.ai/stream")
     API_KEY_PRIVATE_KEY = os.getenv("LIGHTER_API_KEY_PRIVATE_KEY")
     ETH_PRIVATE_KEY = os.getenv("LIGHTER_ETH_PRIVATE_KEY")
     ACCOUNT_INDEX = int(os.getenv("LIGHTER_ACCOUNT_INDEX", "1"))
@@ -22,10 +23,10 @@ class Config:
     # API Limits
     if IS_PREMIUM:
         MAX_REQUESTS_PER_MINUTE = 4000
-        SAFE_DELAY_BETWEEN_TRADES = 0.5
+        SAFE_DELAY_BETWEEN_OPERATIONS = 0.5
     else:
-        MAX_REQUESTS_PER_MINUTE = 10  # Standard: 60/6 = 10 max
-        SAFE_DELAY_BETWEEN_TRADES = 7  # Safe for standard account
+        MAX_REQUESTS_PER_MINUTE = 10
+        SAFE_DELAY_BETWEEN_OPERATIONS = 7
 
     # MongoDB
     MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
@@ -38,15 +39,19 @@ class Config:
     TRADING_TOKENS: List[str] = os.getenv("TRADING_TOKENS", "ETH,BTC,SOL").split(",")
     DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "3"))
 
+    # TP/SL Configuration (can be very small percentages)
+    TAKE_PROFIT_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", "0.1"))
+    STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", "0.5"))
+
     # Position timing
-    POSITION_HOLD_TIME_MIN = float(os.getenv("POSITION_HOLD_TIME_MIN", "2"))
-    POSITION_HOLD_TIME_MAX = float(os.getenv("POSITION_HOLD_TIME_MAX", "5"))
-    DELAY_BETWEEN_TRADES = float(os.getenv("DELAY_BETWEEN_TRADES", "3"))
+    POSITION_HOLD_TIME_MIN = float(os.getenv("POSITION_HOLD_TIME_MIN", "30"))
+    POSITION_HOLD_TIME_MAX = float(os.getenv("POSITION_HOLD_TIME_MAX", "60"))
+    DELAY_BETWEEN_TRADES_PER_TOKEN = float(os.getenv("DELAY_BETWEEN_TRADES_PER_TOKEN", "3"))
 
     # Logging
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
-    # Market indices (from Lighter)
+    # Market indices
     MARKET_INDICES: Dict[str, int] = {
         "ETH": 0,
         "BTC": 1,
@@ -56,12 +61,8 @@ class Config:
         "LINK": 5,
         "UNI": 6,
         "AAVE": 7,
-        "HYPE": 24  # Added from your example
+        "HYPE": 24
     }
-
-    # Price scaling (Lighter uses integer prices with 2 decimal places)
-    PRICE_SCALE = 100  # For price conversion
-    BASE_AMOUNT_SCALE = 1  # BaseAmount seems to be in smallest units
 
     @classmethod
     def validate(cls):
