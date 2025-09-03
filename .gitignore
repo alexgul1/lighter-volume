@@ -1,4 +1,4 @@
 .env
 .idea/
 *.txt
-__pycache__
+**/__pycache__/**

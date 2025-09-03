@@ -12,23 +12,19 @@ class Transaction:
     """Transaction model for futures trades"""
 
     def __init__(self, tx_type: str, position_type: str, token: str,
-                 amount_usdc: float, base_amount: int, price: Optional[int] = None,
-                 avg_entry_price: Optional[float] = None, tp_price: Optional[float] = None,
-                 sl_price: Optional[float] = None, is_success: bool = False,
-                 dependency: Optional[int] = None, order_id: Optional[str] = None,
-                 tx_hash: Optional[str] = None, error: Optional[str] = None):
+                 amount_usdc: float, base_amount: int, price: int,
+                 is_success: bool = False, dependency: Optional[int] = None,
+                 order_id: Optional[str] = None, tx_hash: Optional[str] = None,
+                 error: Optional[str] = None):
         self.date = datetime.utcnow()
-        self.type = tx_type  # "open", "close", "tp_order", "sl_order"
+        self.type = tx_type  # "open" or "close"
         self.position_type = position_type  # "long" or "short"
         self.token = token
         self.amount_usdc = amount_usdc
         self.base_amount = base_amount
         self.price = price
-        self.avg_entry_price = avg_entry_price
-        self.tp_price = tp_price
-        self.sl_price = sl_price
         self.is_success = is_success
-        self.dependency = dependency
+        self.dependency = dependency  # For close, references open txId
         self.order_id = order_id
         self.tx_hash = tx_hash
         self.error = error
@@ -42,9 +38,6 @@ class Transaction:
             "amount_usdc": self.amount_usdc,
             "base_amount": self.base_amount,
             "price": self.price,
-            "avg_entry_price": self.avg_entry_price,
-            "tp_price": self.tp_price,
-            "sl_price": self.sl_price,
             "is_success": self.is_success,
             "dependency": self.dependency,
             "order_id": self.order_id,
@@ -78,7 +71,6 @@ class DatabaseManager:
             await self.collection.create_index([("date", DESCENDING)])
             await self.collection.create_index([("type", ASCENDING)])
             await self.collection.create_index([("position_type", ASCENDING)])
-            await self.collection.create_index([("token", ASCENDING)])
 
             # Initialize counter
             last_tx = await self.collection.find_one(sort=[("txId", -1)])
