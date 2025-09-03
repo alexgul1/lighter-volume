@@ -75,16 +75,11 @@ class PositionManager:
         position_type = "long" if is_long else "short"
 
         # Calculate amount based on token
-        if token == "ETH":
-            amount_usdc = round(random.uniform(
-                Config.MIN_TRADE_AMOUNT * Config.ETH_MULTIPLIER,
-                Config.MAX_TRADE_AMOUNT * Config.ETH_MULTIPLIER
-            ), 2)
-        else:
-            amount_usdc = round(random.uniform(
-                Config.MIN_TRADE_AMOUNT,
-                Config.MAX_TRADE_AMOUNT
-            ), 2)
+
+        amount_usdc = round(random.uniform(
+            Config.MIN_TRADE_AMOUNT,
+            Config.MAX_TRADE_AMOUNT
+        ), 2)
 
         base_amount = int(amount_usdc)
 
