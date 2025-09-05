@@ -11,7 +11,7 @@ logger = setup_logger("TradingBot", Config.LOG_LEVEL)
 
 
 class TradingBot:
-    """Main trading bot application"""
+    """Enhanced trading bot with WebSocket position monitoring"""
 
     def __init__(self):
         self.db_manager: Optional[DatabaseManager] = None
@@ -25,15 +25,20 @@ class TradingBot:
             # Validate configuration
             Config.validate()
 
-            # Show configuration
+            # Show enhanced configuration
             logger.info("=" * 60)
-            logger.info("LIGHTER FUTURES TRADING BOT")
+            logger.info("LIGHTER FUTURES TRADING BOT V10")
+            logger.info("Enhanced with WebSocket Position Monitoring")
             logger.info("=" * 60)
             logger.info(f"Account Type: {Config.ACCOUNT_TYPE.upper()}")
             logger.info(f"Leverage: {Config.DEFAULT_LEVERAGE}x")
             logger.info(f"Tokens: {Config.TRADING_TOKENS}")
             logger.info(f"Position Size: ${Config.MIN_TRADE_AMOUNT}-${Config.MAX_TRADE_AMOUNT}")
             logger.info(f"Hold Time: {Config.POSITION_HOLD_TIME_MIN}-{Config.POSITION_HOLD_TIME_MAX}s")
+            logger.info(f"Max Hold: {Config.MAX_HOLD_SECONDS}s")
+            logger.info(f"TP/SL: {Config.TP_PERCENT*100:.3f}%/{Config.SL_PERCENT*100:.3f}%")
+            logger.info(f"Per-Token Cooldown: {Config.DELAY_BETWEEN_TRADES}s")
+            logger.info(f"Max Positions per Token: {Config.MAX_POSITIONS_PER_TOKEN}")
             logger.info("=" * 60)
 
             # Initialize database
@@ -48,7 +53,7 @@ class TradingBot:
             self.trading_engine = TradingEngine(self.db_manager)
             await self.trading_engine.initialize()
 
-            logger.info("Bot initialized successfully")
+            logger.info("Bot initialized successfully with WebSocket support")
 
         except Exception as e:
             logger.error(f"Failed to initialize bot: {e}")
