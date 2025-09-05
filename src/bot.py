@@ -121,8 +121,8 @@ class TradingBot:
     async def run(self):
         """Run the bot"""
         try:
-            await self.web_socket_client.initialize()
             await self.initialize()
+            await self.web_socket_client.initialize()
 
             # Setup signal handlers
             loop = asyncio.get_event_loop()
