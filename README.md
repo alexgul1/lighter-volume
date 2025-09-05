@@ -1,190 +1,40 @@
-# Lighter Protocol Trading Bot
-## Enhanced with WebSocket Position Monitoring & Automatic TP/SL
+# Lighter Futures Trading Bot
 
-### Key Enhancements
+Automated futures trading bot for Lighter Protocol. Opens and closes long/short positions to maximize volume during the zero-fee beta period.
 
-#### 1. **WebSocket Position Monitoring**
-- Real-time subscription to `account_all/{ACCOUNT_INDEX}` channel
-- Receives live position updates including average entry price, position value, and PnL
-- Automatic reconnection on disconnect
+## Key Features
 
-#### 2. **Automatic Take Profit / Stop Loss**
-- Sets TP/SL orders immediately after receiving position confirmation via WebSocket
-- Configurable percentages (supports 0.00001 to 1.0)
-- Uses TAKE_PROFIT_LIMIT and STOP_LOSS_LIMIT order types
-- Automatically cancels TP/SL orders before closing positions
+- **Futures Trading**: Opens both LONG and SHORT positions randomly
+- **Automatic Position Management**: Opens positions and closes them after 2-5 seconds
+- **Leverage Control**: Sets configurable leverage (default 3x) at startup
+- **Smart Timing**: Configurable delays between trades and position hold times
+- **MongoDB Logging**: Complete audit trail of all positions
+- **Zero Fees**: Optimized for standard accounts with 0% fees during beta
 
-#### 3. **Per-Token Cooldown System**
-- Independent cooldown timer for each token
-- Prevents opening new positions for X seconds after closing
-- Allows parallel trading (e.g., BTC can trade while ETH is in cooldown)
+## How It Works
 
-#### 4. **Time-Based Position Closing**
-- Configurable maximum hold time (MAX_HOLD_SECONDS)
-- Automatically closes positions that haven't hit TP/SL within time limit
-- Runs in parallel with normal trading logic
+1. **Set Leverage**: On startup, sets leverage for all configured markets
+2. **Open Position**: Randomly selects token and direction (long/short)
+3. **Hold Position**: Waits 2-5 seconds (configurable)
+4. **Close Position**: Automatically closes with opposite order
+5. **Repeat**: Waits configured delay, then opens next position
 
-### Configuration
-
-Create a `.env` file with the following parameters:
+## Configuration (.env)
 
 ```env
-# API Keys (Required)
-LIGHTER_API_KEY_PRIVATE_KEY=your_api_key
-LIGHTER_ETH_PRIVATE_KEY=your_eth_key
+# API Keys (REQUIRED)
+LIGHTER_API_KEY_PRIVATE_KEY=your_api_key_here
+LIGHTER_ETH_PRIVATE_KEY=your_eth_private_key_here
 LIGHTER_ACCOUNT_INDEX=1
 LIGHTER_API_KEY_INDEX=2
 
-# Trading Parameters
-TRADING_TOKENS=ETH,BTC,SOL
+# Trading Settings
 MIN_TRADE_AMOUNT_USDC=10.0
 MAX_TRADE_AMOUNT_USDC=50.0
+TRADING_TOKENS=ETH,BTC,SOL
 DEFAULT_LEVERAGE=3
 
-# TP/SL Configuration (as decimals)
-TP_PERCENT=0.001  # 0.1%
-SL_PERCENT=0.001  # 0.1%
-
-# Timing Configuration
-POSITION_HOLD_TIME_MIN=2  # Min seconds
-POSITION_HOLD_TIME_MAX=5  # Max seconds
-MAX_HOLD_SECONDS=300  # Force close after 5 minutes
-DELAY_BETWEEN_TRADES=3  # Per-token cooldown
-
-# MongoDB
-MONGODB_URI=mongodb://localhost:27017
-MONGODB_DATABASE=lighter_bot
-```
-
-### Installation
-
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Run the bot
-python main.py
-```
-
-### How It Works
-
-1. **Position Opening**
-   - Bot checks which tokens are not in cooldown
-   - Opens random long/short positions with market orders
-   - Stores position in memory with unique ID
-
-2. **WebSocket Monitoring**
-   - Receives position update with average entry price
-   - Calculates TP price: entry ± TP_PERCENT
-   - Calculates SL price: entry ± SL_PERCENT
-   - Places both orders automatically
-
-3. **Position Closing** (Three ways)
-   - **TP/SL Hit**: Position closes automatically via exchange
-   - **Time Limit**: Force close after MAX_HOLD_SECONDS
-   - **Random Hold**: Close after POSITION_HOLD_TIME_MIN/MAX
-
-4. **Cooldown Management**
-   - After closing, token enters cooldown for DELAY_BETWEEN_TRADES seconds
-   - Other tokens can continue trading independently
-
-### Database Schema
-
-All trades are logged to MongoDB with:
-- Transaction type (open/close)
-- Position type (long/short)
-- Token and amounts
-- Order IDs and hashes
-- Success/failure status
-- Dependencies (close references open)
-
-### Rate Limits
-
-**Standard Account:**
-- 60 weighted requests per minute
-- sendTx weight: 6 (max 10 trades/minute)
-- Safe delay: 7 seconds between trades
-
-**Premium Account:**
-- 4000 weighted requests per minute
-- Lower latency for HFT
-- Fees apply: 0.002% maker, 0.02% taker
-
-### Safety Features
-
-- Automatic position closing on shutdown
-- Per-token position limits
-- WebSocket auto-reconnection
-- Nonce management for transaction ordering
-- Comprehensive error logging
-
-### Monitoring
-
-The bot provides real-time statistics:
-- Total positions opened
-- Long vs Short distribution
-- Total volume traded
-- Positions per hour rate
-- Individual position PnL (when available)
-
-### Troubleshooting
-
-1. **WebSocket Connection Issues**
-   - Check auth token generation
-   - Verify account index is correct
-   - Ensure network connectivity
-
-2. **TP/SL Not Setting**
-   - Verify position updates are received
-   - Check TP/SL percentages are valid
-   - Ensure sufficient margin for orders
-
-3. **Cooldown Not Working**
-   - Check DELAY_BETWEEN_TRADES setting
-   - Verify token tracking in memory
-   - Review logs for timing issues
-
-### Advanced Configuration
-
-For very small TP/SL targets:
-```env
-TP_PERCENT=0.00001  # 0.001%
-SL_PERCENT=0.00005  # 0.005%
-```
-
-For aggressive position management:
-```env
-MAX_POSITIONS_PER_TOKEN=5
-MAX_HOLD_SECONDS=60  # 1 minute max
-DELAY_BETWEEN_TRADES=1  # 1 second cooldown
-```
-
-### Architecture
-
-```
-main.py
-├── bot.py (Main application controller)
-├── trading_engine.py (Core trading logic + WebSocket)
-├── database.py (MongoDB integration)
-├── config.py (Configuration management)
-└── utils.py (Logging and statistics)
-```
-
-### API Weight Usage
-
-Per operation weight consumption:
-- Open position: 6 (sendTx)
-- Set TP order: 6 (sendTx)
-- Set SL order: 6 (sendTx)
-- Cancel order: 6 (sendTx)
-- Close position: 6 (sendTx)
-
-Total per position lifecycle: ~30 weight units
-
-### Notes
-
-- WebSocket provides real-time position data without polling
-- TP/SL orders remain on exchange even if bot disconnects
-- Database preserves full trading history for analysis
-- Bot can recover from temporary disconnections
-- Multiple instances should not share the same API key
+# Position Timing
+POSITION_HOLD_TIME_MIN=2
+POSITION_HOLD_TIME_MAX=5
+DELAY_BETWEEN_TRADES=3
