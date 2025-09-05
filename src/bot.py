@@ -6,7 +6,7 @@ from src.config import Config
 from src.database import DatabaseManager
 from src.trading_engine import TradingEngine
 from src.utils import setup_logger
-from src.websocket import WebSocketConfig, TradeMonitorClient
+from src.websocket import WebSocketConfig, TradeMonitorClient, PositionInfo, TradeData
 
 logger = setup_logger("TradingBot", Config.LOG_LEVEL)
 
@@ -59,20 +59,45 @@ class TradingBot:
             )
             self.web_socket_client = TradeMonitorClient(self.web_socket_config)
 
-            async def on_position_opened(position):
-                print(f"New position opened: {position}")
+            # Define callbacks that receive full position data
+            async def on_position_opened(position: PositionInfo):
+                print(f"\n=== POSITION OPENED ===")
+                print(f"Symbol: {position.symbol}")
+                print(f"Direction: {'LONG' if position.is_long else 'SHORT'}")
+                print(f"Size: {position.size}")
+                print(f"Entry Price: {position.entry_price}")
+                print(f"Value: ${position.current_value:.2f}")
+                print(f"Market ID: {position.market_id}")
+                print("=" * 30)
 
-            async def on_position_closed(position):
-                print(f"Position closed: {position}")
+                # Here you can implement TP/SL logic
+                # You have all the data needed for position management
+                return position
 
-            async def on_position_updated(new_position, old_position):
-                print(f"Position updated: {new_position}")
+            async def on_position_closed(position: PositionInfo):
+                print(f"\n=== POSITION CLOSED ===")
+                print(f"Symbol: {position.symbol}")
+                print(f"Direction: {'LONG' if position.is_long else 'SHORT'}")
+                print(f"Entry Price: {position.entry_price}")
+                print(f"Exit Price: {position.trades[-1].price if position.trades else 'Unknown'}")
+                print(f"Realized PnL: ${position.realized_pnl:.2f}" if position.realized_pnl else "N/A")
+                print(f"Total Trades: {len(position.trades)}")
+                print("=" * 30)
+                return position
 
+            async def on_position_modified(position: PositionInfo, trade: TradeData):
+                print(f"\n=== POSITION MODIFIED ===")
+                print(f"Symbol: {position.symbol}")
+                print(f"New Size: {position.size}")
+                print(f"Trade Price: {trade.price}")
+                print(f"Trade Size: {trade.size}")
+                print("=" * 30)
+                return position
                 # Register callbacks
 
             self.web_socket_client.on_position_opened = on_position_opened
             self.web_socket_client.on_position_closed = on_position_closed
-            self.web_socket_client.on_position_updated = on_position_updated
+            self.web_socket_client.n_position_modified = on_position_modified
 
             logger.info("Bot initialized successfully")
 
