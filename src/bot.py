@@ -6,7 +6,7 @@ from src.config import Config
 from src.database import DatabaseManager
 from src.trading_engine import TradingEngine
 from src.utils import setup_logger
-from src.websocket import WebSocketConfig, LighterWebSocketClient, TradeMonitorClient
+from src.websocket import WebSocketConfig, TradeMonitorClient
 
 logger = setup_logger("TradingBot", Config.LOG_LEVEL)
 
