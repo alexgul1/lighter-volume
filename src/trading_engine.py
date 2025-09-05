@@ -1,4 +1,3 @@
-import os
 import asyncio
 import json
 import random
@@ -9,6 +8,7 @@ import lighter
 import websockets
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from collections import deque
 
 from src.config import Config
 from src.database import DatabaseManager, Transaction
@@ -18,14 +18,55 @@ logger = setup_logger(__name__, Config.LOG_LEVEL)
 
 
 @dataclass
+class RateLimiter:
+    """Rate limiter for API requests"""
+    max_weight_per_minute: int = 60  # Standard account limit
+    request_weight: int = 6  # Weight per sendTx
+
+    def __init__(self):
+        self.requests = deque()  # Store (timestamp, weight) tuples
+        self.total_weight = 0
+
+    def can_make_request(self, weight: int = 6) -> bool:
+        """Check if we can make a request without exceeding limits"""
+        self._cleanup_old_requests()
+        return (self.total_weight + weight) <= self.max_weight_per_minute
+
+    def add_request(self, weight: int = 6):
+        """Record a request"""
+        self.requests.append((time.time(), weight))
+        self.total_weight += weight
+
+    def _cleanup_old_requests(self):
+        """Remove requests older than 60 seconds"""
+        current_time = time.time()
+        while self.requests and (current_time - self.requests[0][0]) > 60:
+            _, weight = self.requests.popleft()
+            self.total_weight -= weight
+
+    def get_wait_time(self, weight: int = 6) -> float:
+        """Get seconds to wait before we can make a request"""
+        self._cleanup_old_requests()
+        if self.can_make_request(weight):
+            return 0
+
+        # Find the oldest request that needs to expire
+        if self.requests:
+            oldest_time = self.requests[0][0]
+            wait_time = 60 - (time.time() - oldest_time) + 1  # +1 second buffer
+            return max(0, wait_time)
+        return 0
+
+
+@dataclass
 class PositionTPSL:
     """Take Profit and Stop Loss settings for a position"""
     take_profit_price: int
     stop_loss_price: int
     tp_order_index: Optional[int] = None
     sl_order_index: Optional[int] = None
-    tp_order_id: Optional[str] = None
-    sl_order_id: Optional[str] = None
+    tp_set: bool = False
+    sl_set: bool = False
 
 
 class Position:
@@ -53,6 +94,7 @@ class Position:
 
         # TP/SL settings
         self.tp_sl: Optional[PositionTPSL] = None
+        self.tp_sl_pending = False  # Flag to prevent multiple TP/SL attempts
 
         # Time-based close
         self.max_hold_time: float = 0
@@ -60,12 +102,7 @@ class Position:
 
 class TradingEngine:
     """
-    Enhanced futures trading engine for Lighter Protocol.
-    Features:
-    - WebSocket position monitoring
-    - Automatic TP/SL management
-    - Per-token cooldown delays
-    - Time-based position closing
+    Enhanced futures trading engine with proper rate limiting.
     """
 
     def __init__(self, db_manager: DatabaseManager):
@@ -77,15 +114,26 @@ class TradingEngine:
         self.ws_task = None
 
         # Trading state
-        self.active_positions: Dict[str, Position] = {}  # position_id -> Position
-        self.positions_by_token: Dict[str, List[str]] = {}  # token -> list of position_ids
-        self.positions_by_market: Dict[int, List[str]] = {}  # market_id -> list of position_ids
+        self.active_positions: Dict[str, Position] = {}
+        self.positions_by_token: Dict[str, List[str]] = {}
+        self.positions_by_market: Dict[int, List[str]] = {}
         self.running = False
         self.stats = Stats()
 
+        # Rate limiting
+        self.rate_limiter = RateLimiter()
+
         # Per-token cooldown tracking
-        self.token_last_close_time: Dict[str, float] = {}  # token -> last close timestamp
-        self.token_cooldown_seconds: float = Config.DELAY_BETWEEN_TRADES
+        self.token_last_close_time: Dict[str, float] = {}
+
+        # Global trade spacing for standard accounts
+        if Config.IS_PREMIUM:
+            self.min_seconds_between_trades = 0.5
+        else:
+            # Standard account: 10 trades/min max = 6 seconds minimum between trades
+            self.min_seconds_between_trades = 6.5  # Add 0.5s buffer
+
+        self.last_trade_time = 0
 
         # Track order indices
         self.next_order_index = 1000
@@ -97,13 +145,6 @@ class TradingEngine:
 
         # WebSocket authentication
         self.auth_token = None
-
-        # TP/SL configuration (as percentage)
-        self.tp_percent = float(os.getenv("TP_PERCENT", "0.001"))  # 0.1%
-        self.sl_percent = float(os.getenv("SL_PERCENT", "0.001"))  # 0.1%
-
-        # Max position hold time (seconds)
-        self.max_hold_seconds = float(os.getenv("MAX_HOLD_SECONDS", "300"))  # 5 minutes
 
     async def initialize(self):
         """Initialize Lighter client and WebSocket"""
@@ -134,24 +175,50 @@ class TradingEngine:
             self.current_nonce = next_nonce.nonce
 
             # Create auth token for WebSocket
-            self.auth_token, err = self.client.create_auth_token_with_expiry(60000)  # 10 min expiry
+            self.auth_token, err = self.client.create_auth_token_with_expiry(
+                Config.AUTH_TOKEN_EXPIRY
+            )
             if err:
                 raise Exception(f"Failed to create auth token: {err}")
 
-            # Set leverage for all markets
+            # Set leverage for all markets (with rate limiting)
             await self._set_leverage_for_markets()
 
             # Start WebSocket connection
             await self._start_websocket()
 
             logger.info(f"Trading engine initialized (Account type: {Config.ACCOUNT_TYPE})")
-            logger.info(f"Default leverage: {Config.DEFAULT_LEVERAGE}x")
-            logger.info(f"TP/SL: {self.tp_percent * 100}%/{self.sl_percent * 100}%")
-            logger.info(f"Max hold time: {self.max_hold_seconds}s")
-            logger.info(f"Per-token cooldown: {self.token_cooldown_seconds}s")
+            logger.info(f"Rate limit: 60 weight/min, {10 if not Config.IS_PREMIUM else 600} trades/min max")
+            logger.info(f"Min time between trades: {self.min_seconds_between_trades}s")
+            logger.info(f"TP/SL: {Config.TP_PERCENT * 100}%/{Config.SL_PERCENT * 100}%")
 
         except Exception as e:
             logger.error(f"Failed to initialize: {e}")
+            raise
+
+    async def _wait_for_rate_limit(self, weight: int = 6) -> None:
+        """Wait if necessary to respect rate limits"""
+        wait_time = self.rate_limiter.get_wait_time(weight)
+        if wait_time > 0:
+            logger.warning(f"Rate limit reached, waiting {wait_time:.1f}s...")
+            await asyncio.sleep(wait_time)
+
+    async def _send_transaction_with_limit(self, tx_type: int, tx_info: str) -> Any:
+        """Send transaction with rate limiting"""
+        await self._wait_for_rate_limit(6)
+
+        try:
+            result = await self.transaction_api.send_tx(
+                tx_type=tx_type,
+                tx_info=tx_info
+            )
+            self.rate_limiter.add_request(6)
+            return result
+        except Exception as e:
+            if "429" in str(e) or "Too Many Requests" in str(e):
+                logger.error("Rate limit hit despite checking, backing off for 30s...")
+                await asyncio.sleep(30)
+                raise
             raise
 
     async def _start_websocket(self):
@@ -160,7 +227,7 @@ class TradingEngine:
 
     async def _websocket_handler(self):
         """Handle WebSocket connection and messages"""
-        ws_url = "wss://mainnet.zklighter.elliot.ai/stream"
+        ws_url = Config.WS_URL
 
         while self.running:
             try:
@@ -171,9 +238,7 @@ class TradingEngine:
                     # Authenticate
                     auth_msg = {
                         "type": "authenticate",
-                        "data": {
-                            "auth_token": self.auth_token
-                        }
+                        "data": {"auth_token": self.auth_token}
                     }
                     await websocket.send(json.dumps(auth_msg))
 
@@ -191,12 +256,12 @@ class TradingEngine:
                             data = json.loads(message)
                             await self._process_websocket_message(data)
                         except json.JSONDecodeError:
-                            logger.error(f"Invalid JSON in WebSocket message: {message}")
+                            logger.error(f"Invalid JSON: {message[:100]}")
                         except Exception as e:
-                            logger.error(f"Error processing WebSocket message: {e}")
+                            logger.error(f"Error processing message: {e}")
 
             except websockets.exceptions.ConnectionClosed:
-                logger.warning("WebSocket connection closed, reconnecting...")
+                logger.warning("WebSocket disconnected, reconnecting in 5s...")
                 await asyncio.sleep(5)
             except Exception as e:
                 logger.error(f"WebSocket error: {e}")
@@ -204,163 +269,129 @@ class TradingEngine:
 
     async def _process_websocket_message(self, data: Dict[str, Any]):
         """Process WebSocket message for position updates"""
-        if data.get("channel", "").startswith("account_all"):
-            positions = data.get("data", {}).get("positions", [])
+        try:
+            if "account_all" in data.get("channel", ""):
+                positions = data.get("data", {}).get("positions", [])
 
-            for pos_data in positions:
-                market_id = pos_data.get("market_id")
-                if market_id is None:
-                    continue
+                for pos_data in positions:
+                    market_id = pos_data.get("market_id")
+                    avg_price = pos_data.get("avg_entry_price")
 
-                # Find our positions for this market
-                position_ids = self.positions_by_market.get(market_id, [])
-
-                for position_id in position_ids:
-                    position = self.active_positions.get(position_id)
-                    if not position:
+                    if market_id is None or not avg_price:
                         continue
 
-                    # Update position data from WebSocket
-                    position.avg_entry_price = pos_data.get("avg_entry_price")
-                    position.position_value = pos_data.get("position_value")
-                    position.unrealized_pnl = pos_data.get("unrealized_pnl")
+                    # Find our positions for this market
+                    position_ids = self.positions_by_market.get(market_id, [])
 
-                    # Set TP/SL if not already set
-                    if position.avg_entry_price and not position.tp_sl:
-                        await self._set_tp_sl_for_position(position)
+                    for position_id in position_ids:
+                        position = self.active_positions.get(position_id)
+                        if not position or position.tp_sl_pending:
+                            continue
+
+                        # Update position data
+                        position.avg_entry_price = int(avg_price)
+                        position.position_value = pos_data.get("position_value")
+                        position.unrealized_pnl = pos_data.get("unrealized_pnl")
+
+                        # Set TP/SL if not already set
+                        if position.avg_entry_price and not position.tp_sl:
+                            position.tp_sl_pending = True
+                            asyncio.create_task(self._set_tp_sl_for_position(position))
+
+        except Exception as e:
+            logger.error(f"Error processing WebSocket data: {e}")
 
     async def _set_tp_sl_for_position(self, position: Position):
-        """Set take profit and stop loss orders for a position"""
+        """Set TP/SL with proper rate limiting"""
         if not position.avg_entry_price:
             return
 
         try:
             # Calculate TP/SL prices
             if position.is_long:
-                tp_price = int(position.avg_entry_price * (1 + self.tp_percent))
-                sl_price = int(position.avg_entry_price * (1 - self.sl_percent))
+                tp_price = int(position.avg_entry_price * (1 + Config.TP_PERCENT))
+                sl_price = int(position.avg_entry_price * (1 - Config.SL_PERCENT))
             else:
-                tp_price = int(position.avg_entry_price * (1 - self.tp_percent))
-                sl_price = int(position.avg_entry_price * (1 + self.sl_percent))
+                tp_price = int(position.avg_entry_price * (1 - Config.TP_PERCENT))
+                sl_price = int(position.avg_entry_price * (1 + Config.SL_PERCENT))
 
-            # Create TP/SL orders
+            position.tp_sl = PositionTPSL(
+                take_profit_price=tp_price,
+                stop_loss_price=sl_price
+            )
+
+            # Wait for rate limit before setting TP
+            await self._wait_for_rate_limit(6)
+
             tp_order_index = await self.get_next_order_index()
-            sl_order_index = await self.get_next_order_index()
-
-            # Sign take profit order
-            tp_is_ask = position.is_long  # Sell for long TP, Buy for short TP
             tp_tx_info, tp_error = self.client.sign_create_order(
                 market_index=position.market_id,
                 client_order_index=tp_order_index,
                 base_amount=position.base_amount,
                 price=tp_price,
-                is_ask=tp_is_ask,
-                order_type=self.client.ORDER_TYPE_TAKE_PROFIT_LIMIT,
+                is_ask=position.is_long,  # Sell for long TP
+                order_type=self.client.ORDER_TYPE_LIMIT,  # Use limit order
                 time_in_force=self.client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
                 reduce_only=True,
-                trigger_price=tp_price,
-                order_expiry=0,
+                trigger_price=0,
+                order_expiry=int(time.time() + 3600),  # 1 hour expiry
                 nonce=await self.get_next_nonce()
             )
 
-            if tp_error:
-                logger.error(f"Failed to sign TP order: {tp_error}")
-                return
+            if not tp_error:
+                await self._send_transaction_with_limit(
+                    self.client.TX_TYPE_CREATE_ORDER,
+                    tp_tx_info
+                )
+                position.tp_sl.tp_order_index = tp_order_index
+                position.tp_sl.tp_set = True
+                logger.info(f"Set TP for {position.token} at {tp_price} (entry: {position.avg_entry_price})")
 
-            # Sign stop loss order
-            sl_is_ask = position.is_long  # Sell for long SL, Buy for short SL
+            # Wait a bit before SL to avoid rapid requests
+            await asyncio.sleep(2)
+
+            # Wait for rate limit before setting SL
+            await self._wait_for_rate_limit(6)
+
+            sl_order_index = await self.get_next_order_index()
             sl_tx_info, sl_error = self.client.sign_create_order(
                 market_index=position.market_id,
                 client_order_index=sl_order_index,
                 base_amount=position.base_amount,
                 price=sl_price,
-                is_ask=sl_is_ask,
+                is_ask=position.is_long,  # Sell for long SL
                 order_type=self.client.ORDER_TYPE_STOP_LOSS_LIMIT,
                 time_in_force=self.client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
                 reduce_only=True,
                 trigger_price=sl_price,
-                order_expiry=0,
+                order_expiry=int(time.time() + 3600),
                 nonce=await self.get_next_nonce()
             )
 
-            if sl_error:
-                logger.error(f"Failed to sign SL order: {sl_error}")
-                return
-
-            # Send both orders
-            tp_result = await self.transaction_api.send_tx(
-                tx_type=self.client.TX_TYPE_CREATE_ORDER,
-                tx_info=tp_tx_info
-            )
-
-            sl_result = await self.transaction_api.send_tx(
-                tx_type=self.client.TX_TYPE_CREATE_ORDER,
-                tx_info=sl_tx_info
-            )
-
-            # Store TP/SL info
-            position.tp_sl = PositionTPSL(
-                take_profit_price=tp_price,
-                stop_loss_price=sl_price,
-                tp_order_index=tp_order_index,
-                sl_order_index=sl_order_index,
-                tp_order_id=str(tp_result) if tp_result else None,
-                sl_order_id=str(sl_result) if sl_result else None
-            )
-
-            logger.info(f"✅ Set TP/SL for {position.token} position {position.position_id}: "
-                        f"Entry: {position.avg_entry_price}, TP: {tp_price}, SL: {sl_price}")
+            if not sl_error:
+                await self._send_transaction_with_limit(
+                    self.client.TX_TYPE_CREATE_ORDER,
+                    sl_tx_info
+                )
+                position.tp_sl.sl_order_index = sl_order_index
+                position.tp_sl.sl_set = True
+                logger.info(f"Set SL for {position.token} at {sl_price}")
 
         except Exception as e:
-            logger.error(f"Failed to set TP/SL for position {position.position_id}: {e}")
-
-    async def _cancel_tp_sl_orders(self, position: Position):
-        """Cancel TP/SL orders for a position"""
-        if not position.tp_sl:
-            return
-
-        try:
-            # Cancel TP order if exists
-            if position.tp_sl.tp_order_index:
-                cancel_tp_info, error = self.client.sign_cancel_order(
-                    market_index=position.market_id,
-                    order_index=position.tp_sl.tp_order_index,
-                    nonce=await self.get_next_nonce()
-                )
-                if not error:
-                    await self.transaction_api.send_tx(
-                        tx_type=self.client.TX_TYPE_CANCEL_ORDER,
-                        tx_info=cancel_tp_info
-                    )
-
-            # Cancel SL order if exists
-            if position.tp_sl.sl_order_index:
-                cancel_sl_info, error = self.client.sign_cancel_order(
-                    market_index=position.market_id,
-                    order_index=position.tp_sl.sl_order_index,
-                    nonce=await self.get_next_nonce()
-                )
-                if not error:
-                    await self.transaction_api.send_tx(
-                        tx_type=self.client.TX_TYPE_CANCEL_ORDER,
-                        tx_info=cancel_sl_info
-                    )
-
-            logger.info(f"Cancelled TP/SL orders for position {position.position_id}")
-
-        except Exception as e:
-            logger.error(f"Failed to cancel TP/SL orders: {e}")
+            logger.error(f"Failed to set TP/SL for {position.position_id}: {e}")
+            position.tp_sl_pending = False
 
     async def _set_leverage_for_markets(self):
-        """Set leverage for all trading markets"""
+        """Set leverage with rate limiting"""
         for token in Config.TRADING_TOKENS:
             market_index = Config.MARKET_INDICES.get(token)
             if market_index is None:
                 continue
 
             try:
-                imf = int(10000 / Config.DEFAULT_LEVERAGE)
+                await self._wait_for_rate_limit(6)
 
+                imf = int(10000 / Config.DEFAULT_LEVERAGE)
                 tx_info, error = self.client.sign_update_leverage(
                     market_index=market_index,
                     fraction=imf,
@@ -368,17 +399,13 @@ class TradingEngine:
                     nonce=await self.get_next_nonce()
                 )
 
-                if error:
-                    logger.error(f"Failed to sign leverage update for {token}: {error}")
-                    continue
-
-                result = await self.transaction_api.send_tx(
-                    tx_type=self.client.TX_TYPE_UPDATE_LEVERAGE,
-                    tx_info=tx_info
-                )
-
-                logger.info(f"Set leverage {Config.DEFAULT_LEVERAGE}x for {token}")
-                await asyncio.sleep(1)
+                if not error:
+                    await self._send_transaction_with_limit(
+                        self.client.TX_TYPE_UPDATE_LEVERAGE,
+                        tx_info
+                    )
+                    logger.info(f"Set leverage {Config.DEFAULT_LEVERAGE}x for {token}")
+                    await asyncio.sleep(2)  # Space out leverage updates
 
             except Exception as e:
                 logger.error(f"Failed to set leverage for {token}: {e}")
@@ -414,22 +441,14 @@ class TradingEngine:
             self.current_nonce += 1
             return nonce
 
-    async def _can_open_position_for_token(self, token: str) -> bool:
-        """Check if we can open a position for a token based on cooldown"""
-        last_close = self.token_last_close_time.get(token, 0)
-        time_since_close = time.time() - last_close
-        return time_since_close >= self.token_cooldown_seconds
-
     async def start(self):
         """Start trading bot"""
         self.running = True
-        logger.info("🚀 Enhanced futures trading bot started")
+        logger.info("🚀 Trading bot started with rate limiting")
         logger.info(f"Tokens: {Config.TRADING_TOKENS}")
-        logger.info(f"Position size: ${Config.MIN_TRADE_AMOUNT} - ${Config.MAX_TRADE_AMOUNT}")
-        logger.info(f"Hold time: {Config.POSITION_HOLD_TIME_MIN}-{Config.POSITION_HOLD_TIME_MAX}s")
-        logger.info(f"Per-token cooldown: {self.token_cooldown_seconds}s")
+        logger.info(f"Min delay between trades: {self.min_seconds_between_trades}s")
 
-        # Start position monitor task
+        # Start position monitor
         monitor_task = asyncio.create_task(self._position_monitor())
 
         try:
@@ -452,68 +471,83 @@ class TradingEngine:
                     if position.is_closing:
                         continue
 
-                    # Check if position exceeded max hold time
-                    if current_time - position.open_time >= position.max_hold_time:
+                    # Check if exceeded max hold time
+                    hold_duration = current_time - position.open_time
+                    if hold_duration >= Config.MAX_HOLD_SECONDS:
                         positions_to_close.append(position_id)
 
-                # Close positions that exceeded time limit
+                # Close positions one by one with delay
                 for position_id in positions_to_close:
-                    logger.info(f"⏰ Time limit reached for position {position_id}")
-                    asyncio.create_task(self._close_position(position_id))
+                    logger.info(f"⏰ Max hold time reached for {position_id}")
+                    await self._close_position(position_id)
+                    await asyncio.sleep(self.min_seconds_between_trades)
 
-                await asyncio.sleep(1)  # Check every second
+                await asyncio.sleep(5)  # Check every 5 seconds
 
             except Exception as e:
                 logger.error(f"Position monitor error: {e}")
-                await asyncio.sleep(1)
+                await asyncio.sleep(5)
 
     async def stop(self):
         """Stop trading bot"""
         self.running = False
 
-        # Close all open positions
+        # Close positions with proper spacing
         if self.active_positions:
-            logger.info(f"Closing {len(self.active_positions)} open positions...")
-            close_tasks = []
-            for position_id, position in self.active_positions.items():
-                if not position.is_closing:
-                    close_tasks.append(self._close_position(position_id))
-            if close_tasks:
-                await asyncio.gather(*close_tasks, return_exceptions=True)
+            logger.info(f"Closing {len(self.active_positions)} positions...")
+            for position_id in list(self.active_positions.keys()):
+                position = self.active_positions.get(position_id)
+                if position and not position.is_closing:
+                    await self._close_position(position_id)
+                    await asyncio.sleep(self.min_seconds_between_trades)
 
         logger.info("Trading bot stopped")
         logger.info(self.stats.get_stats_string())
 
     async def _trading_loop(self):
-        """Main trading loop with per-token cooldowns"""
+        """Main trading loop with proper rate limiting"""
         while self.running:
             try:
-                # Find tokens that are available (not in cooldown)
+                # Enforce minimum time between trades
+                time_since_last = time.time() - self.last_trade_time
+                if time_since_last < self.min_seconds_between_trades:
+                    wait_time = self.min_seconds_between_trades - time_since_last
+                    await asyncio.sleep(wait_time)
+
+                # Check rate limit before attempting trade
+                if not self.rate_limiter.can_make_request(6):
+                    wait_time = self.rate_limiter.get_wait_time(6)
+                    logger.info(f"Rate limit approaching, waiting {wait_time:.1f}s")
+                    await asyncio.sleep(wait_time)
+
+                # Find available tokens (considering cooldown)
                 available_tokens = []
+                current_time = time.time()
+
                 for token in Config.TRADING_TOKENS:
-                    if await self._can_open_position_for_token(token):
-                        available_tokens.append(token)
+                    last_close = self.token_last_close_time.get(token, 0)
+                    if current_time - last_close >= Config.DELAY_BETWEEN_TRADES:
+                        # Check if we have room for more positions
+                        token_positions = len(self.positions_by_token.get(token, []))
+                        if token_positions < Config.MAX_POSITIONS_PER_TOKEN:
+                            available_tokens.append(token)
 
                 if available_tokens:
-                    # Choose from available tokens
                     token = random.choice(available_tokens)
                     await self._open_position(token)
+                    self.last_trade_time = time.time()
                 else:
-                    # All tokens in cooldown, wait a bit
+                    # No tokens available, wait
                     await asyncio.sleep(1)
-
-                # Small delay between position checks
-                await asyncio.sleep(0.5)
 
             except Exception as e:
                 logger.error(f"Trading loop error: {e}")
-                await asyncio.sleep(5)
+                await asyncio.sleep(10)
 
     async def _open_position(self, token: str):
-        """Open a long or short position"""
+        """Open position with rate limiting"""
         market_index = Config.MARKET_INDICES.get(token)
         if market_index is None:
-            logger.error(f"Unknown market for token {token}")
             return
 
         position_id = str(uuid.uuid4())[:8]
@@ -522,17 +556,10 @@ class TradingEngine:
         amount_usdc = round(random.uniform(Config.MIN_TRADE_AMOUNT, Config.MAX_TRADE_AMOUNT), 2)
         base_amount = int(amount_usdc)
 
-        if is_long:
-            price = 999999999
-            is_ask = False
-        else:
-            price = 1
-            is_ask = True
-
         try:
-            token_positions = self.positions_by_token.get(token, [])
-            logger.info(f"📈 Opening {position_type.upper()} {token}: ${amount_usdc} "
-                        f"(ID: {position_id}, Active: {len(token_positions)})")
+            logger.info(f"📈 Opening {position_type} {token}: ${amount_usdc} (ID: {position_id})")
+
+            await self._wait_for_rate_limit(6)
 
             order_index = await self.get_next_order_index()
             nonce = await self.get_next_nonce()
@@ -541,8 +568,8 @@ class TradingEngine:
                 market_index=market_index,
                 client_order_index=order_index,
                 base_amount=base_amount,
-                price=price,
-                is_ask=is_ask,
+                price=999999999 if not is_long else 1,
+                is_ask=not is_long,
                 order_type=self.client.ORDER_TYPE_MARKET,
                 time_in_force=self.client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
                 reduce_only=False,
@@ -552,28 +579,29 @@ class TradingEngine:
             )
 
             if error:
-                logger.error(f"Failed to sign open order: {error}")
+                logger.error(f"Failed to sign: {error}")
                 return
 
-            result = await self.transaction_api.send_tx(
-                tx_type=self.client.TX_TYPE_CREATE_ORDER,
-                tx_info=tx_info
+            result = await self._send_transaction_with_limit(
+                self.client.TX_TYPE_CREATE_ORDER,
+                tx_info
             )
 
+            # Log to database
             tx = Transaction(
                 tx_type="open",
                 position_type=position_type,
                 token=token,
                 amount_usdc=amount_usdc,
                 base_amount=base_amount,
-                price=price,
+                price=999999999 if not is_long else 1,
                 is_success=True,
                 order_id=str(order_index),
                 tx_hash=str(result) if result else None
             )
             open_tx_id = await self.db.log_transaction(tx)
 
-            # Create position with hold time
+            # Create position
             position = Position(
                 position_id=position_id,
                 token=token,
@@ -586,76 +614,57 @@ class TradingEngine:
                 market_id=market_index
             )
 
-            # Set max hold time
-            position.max_hold_time = random.uniform(
-                Config.POSITION_HOLD_TIME_MIN,
-                max(Config.POSITION_HOLD_TIME_MAX, self.max_hold_seconds)
-            )
-
             # Store position
             self.active_positions[position_id] = position
 
-            # Update positions by token
             if token not in self.positions_by_token:
                 self.positions_by_token[token] = []
             self.positions_by_token[token].append(position_id)
 
-            # Update positions by market
             if market_index not in self.positions_by_market:
                 self.positions_by_market[market_index] = []
             self.positions_by_market[market_index].append(position_id)
 
-            logger.info(f"✅ Opened {position_type} {token} (ID: {position_id})")
+            logger.info(f"✅ Opened {position_type} {token}")
             self.stats.add_position(True, amount_usdc, is_long)
 
-        except Exception as e:
-            logger.error(f"Failed to open position for {token}: {e}")
-            tx = Transaction(
-                tx_type="open",
-                position_type=position_type,
-                token=token,
-                amount_usdc=amount_usdc,
-                base_amount=base_amount,
-                price=price,
-                is_success=False,
-                error=str(e)
+            # Schedule close (randomized hold time)
+            hold_time = random.uniform(
+                Config.POSITION_HOLD_TIME_MIN,
+                Config.POSITION_HOLD_TIME_MAX
             )
-            await self.db.log_transaction(tx)
+            asyncio.create_task(self._schedule_close(position_id, hold_time))
+
+        except Exception as e:
+            logger.error(f"Failed to open position: {e}")
+
+    async def _schedule_close(self, position_id: str, hold_time: float):
+        """Schedule position close"""
+        await asyncio.sleep(hold_time)
+        await self._close_position(position_id)
 
     async def _close_position(self, position_id: str):
-        """Close a specific position by ID"""
+        """Close position with rate limiting"""
         position = self.active_positions.get(position_id)
         if not position or position.is_closing:
             return
 
         position.is_closing = True
-        market_index = Config.MARKET_INDICES.get(position.token)
-        if market_index is None:
-            return
-
-        # Cancel TP/SL orders first
-        await self._cancel_tp_sl_orders(position)
-
-        if position.is_long:
-            price = 1
-            is_ask = True
-        else:
-            price = 999999999
-            is_ask = False
 
         try:
-            logger.info(f"📉 Closing {position.position_type.upper()} {position.token} "
-                        f"(ID: {position_id})")
+            logger.info(f"📉 Closing {position.position_type} {position.token} (ID: {position_id})")
+
+            await self._wait_for_rate_limit(6)
 
             order_index = await self.get_next_order_index()
             nonce = await self.get_next_nonce()
 
             tx_info, error = self.client.sign_create_order(
-                market_index=market_index,
+                market_index=position.market_id,
                 client_order_index=order_index,
                 base_amount=position.base_amount,
-                price=price,
-                is_ask=is_ask,
+                price=1 if position.is_long else 999999999,
+                is_ask=position.is_long,
                 order_type=self.client.ORDER_TYPE_MARKET,
                 time_in_force=self.client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
                 reduce_only=True,
@@ -665,22 +674,23 @@ class TradingEngine:
             )
 
             if error:
-                logger.error(f"Failed to sign close order: {error}")
+                logger.error(f"Failed to sign close: {error}")
                 position.is_closing = False
                 return
 
-            result = await self.transaction_api.send_tx(
-                tx_type=self.client.TX_TYPE_CREATE_ORDER,
-                tx_info=tx_info
+            result = await self._send_transaction_with_limit(
+                self.client.TX_TYPE_CREATE_ORDER,
+                tx_info
             )
 
+            # Log to database
             tx = Transaction(
                 tx_type="close",
                 position_type=position.position_type,
                 token=position.token,
                 amount_usdc=position.amount_usdc,
                 base_amount=position.base_amount,
-                price=price,
+                price=1 if position.is_long else 999999999,
                 is_success=True,
                 dependency=position.open_tx_id,
                 order_id=str(order_index),
@@ -688,48 +698,25 @@ class TradingEngine:
             )
             await self.db.log_transaction(tx)
 
-            # Update token cooldown
+            # Update cooldown
             self.token_last_close_time[position.token] = time.time()
 
-            # Remove from active positions
+            # Remove position
             del self.active_positions[position_id]
 
-            # Remove from positions by token
             if position.token in self.positions_by_token:
                 self.positions_by_token[position.token].remove(position_id)
                 if not self.positions_by_token[position.token]:
                     del self.positions_by_token[position.token]
 
-            # Remove from positions by market
             if position.market_id in self.positions_by_market:
                 self.positions_by_market[position.market_id].remove(position_id)
                 if not self.positions_by_market[position.market_id]:
                     del self.positions_by_market[position.market_id]
 
-            remaining = len(self.positions_by_token.get(position.token, []))
-            logger.info(f"✅ Closed {position.position_type} {position.token} "
-                        f"(ID: {position_id}, Remaining: {remaining})")
-
-            # Log PnL if available
-            if position.unrealized_pnl is not None:
-                pnl_usd = position.unrealized_pnl / 100  # Convert from cents
-                logger.info(f"💰 PnL: ${pnl_usd:.2f}")
-
+            logger.info(f"✅ Closed {position.token} position")
             logger.info(self.stats.get_stats_string())
 
         except Exception as e:
-            logger.error(f"Failed to close position {position_id}: {e}")
+            logger.error(f"Failed to close: {e}")
             position.is_closing = False
-
-            tx = Transaction(
-                tx_type="close",
-                position_type=position.position_type,
-                token=position.token,
-                amount_usdc=position.amount_usdc,
-                base_amount=position.base_amount,
-                price=price,
-                is_success=False,
-                dependency=position.open_tx_id,
-                error=str(e)
-            )
-            await self.db.log_transaction(tx)
