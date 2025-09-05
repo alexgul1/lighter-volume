@@ -45,10 +45,15 @@ async def main():
     client.on_position_updated = on_position_updated
 
     # Initialize and connect
-    await client.initialize()
+    try:
+        await client.initialize()
+        await client.connect()
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
 
     try:
-        await client.connect()
         await bot.run()
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
