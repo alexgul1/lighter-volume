@@ -353,11 +353,25 @@ class TradeMonitorClient:
             if msg_type == "subscribed":
                 logger.info(f"Subscription confirmed: {channel}")
 
-            # Process trade data
-            elif f"account_all_trades" in channel:
-                trades = data.get("trades", [])
-                for trade_data in trades:
-                    await self.process_trade(trade_data)
+            # Process trade data - correct structure
+            elif "account_all_trades" in channel or msg_type == "update/account_all_trades":
+                # Trades are organized by market_index as a dictionary
+                trades_by_market = data.get("trades", {})
+
+                # Process trades for each market
+                for market_index, trades_list in trades_by_market.items():
+                    # trades_list is an array of trades for this market
+                    if isinstance(trades_list, list):
+                        for trade_data in trades_list:
+                            await self.process_trade(trade_data)
+                    elif isinstance(trades_list, dict):
+                        # Single trade
+                        await self.process_trade(trades_list)
+
+                # Log volume stats if available
+                if "total_volume" in data:
+                    logger.debug(f"Volume stats - Total: {data.get('total_volume')}, "
+                                 f"Daily: {data.get('daily_volume')}")
 
             # Handle errors
             elif msg_type == "error":
