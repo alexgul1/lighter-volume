@@ -354,8 +354,8 @@ class TradeMonitorClient:
                 logger.info(f"Subscription confirmed: {channel}")
 
             # Process trade data
-            elif f"account_all_trades:{self.config.account_index}" in channel:
-                trades = data.get("trades", [])
+            elif "account_all_trades" in channel:
+                trades = data.get("data", {}).get("trades", [])
                 for trade_data in trades:
                     await self.process_trade(trade_data)
 
