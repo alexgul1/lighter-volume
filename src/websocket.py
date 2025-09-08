@@ -111,7 +111,7 @@ class LighterWebSocketClient:
             self.auth_token = token
             self.token_expiry_time = time.time() + self.config.auth_token_lifetime_seconds
 
-            logger.info(f"Generated new auth token, expires at {datetime.fromtimestamp(self.token_expiry_time)} {token}")
+            logger.info(f"Generated new auth token, expires at {datetime.fromtimestamp(self.token_expiry_time)}")
             return token
 
         except Exception as e:
