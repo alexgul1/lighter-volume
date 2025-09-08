@@ -6,7 +6,7 @@ from src.config import Config
 from src.database import DatabaseManager
 from src.trading_engine import TradingEngine
 from src.utils import setup_logger
-from src.websocket import WebSocketConfig, LighterWebSocketClient, TradeMonitorClient
+from src.websocket import WebSocketConfig, LighterWebSocketClient
 
 logger = setup_logger("TradingBot", Config.LOG_LEVEL)
 
@@ -57,7 +57,7 @@ class TradingBot:
                 auth_token_lifetime_seconds=600,  # 10 minutes
                 token_refresh_buffer_seconds=30,
             )
-            self.web_socket_client = TradeMonitorClient(self.web_socket_config)
+            self.web_socket_client = LighterWebSocketClient(self.web_socket_config)
 
             async def on_position_opened(position):
                 print(f"New position opened: {position}")
@@ -121,8 +121,8 @@ class TradingBot:
     async def run(self):
         """Run the bot"""
         try:
-            await self.web_socket_client.initialize()
             await self.initialize()
+            await self.web_socket_client.initialize()
 
             # Setup signal handlers
             loop = asyncio.get_event_loop()
@@ -133,8 +133,8 @@ class TradingBot:
                 )
 
             # Start trading
-            websocket_task = asyncio.create_task(self.web_socket_client.connect())
             trading_task = asyncio.create_task(self.start())
+            websocket_task = asyncio.create_task(self.web_socket_client.connect())
 
             # Wait for shutdown
             await self._shutdown_event.wait()
