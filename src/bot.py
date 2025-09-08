@@ -6,7 +6,6 @@ from src.config import Config
 from src.database import DatabaseManager
 from src.trading_engine import TradingEngine
 from src.utils import setup_logger
-from src.websocket import WebSocketConfig, LighterWebSocketClient
 
 logger = setup_logger("TradingBot", Config.LOG_LEVEL)
 
@@ -18,8 +17,6 @@ class TradingBot:
         self.db_manager: Optional[DatabaseManager] = None
         self.trading_engine: Optional[TradingEngine] = None
         self.running = False
-        self.web_socket_config = None
-        self.web_socket_client = None
         self._shutdown_event = asyncio.Event()
 
     async def initialize(self):
@@ -50,29 +47,6 @@ class TradingBot:
             # Initialize trading engine
             self.trading_engine = TradingEngine(self.db_manager)
             await self.trading_engine.initialize()
-            self.web_socket_config = WebSocketConfig(
-                api_key_private_key=Config.API_KEY_PRIVATE_KEY,
-                account_index=Config.ACCOUNT_INDEX,
-                api_key_index=Config.API_KEY_INDEX,
-                auth_token_lifetime_seconds=600,  # 10 minutes
-                token_refresh_buffer_seconds=30,
-            )
-            self.web_socket_client = LighterWebSocketClient(self.web_socket_config)
-
-            async def on_position_opened(position):
-                print(f"New position opened: {position}")
-
-            async def on_position_closed(position):
-                print(f"Position closed: {position}")
-
-            async def on_position_updated(new_position, old_position):
-                print(f"Position updated: {new_position}")
-
-                # Register callbacks
-
-            self.web_socket_client.on_position_opened = on_position_opened
-            self.web_socket_client.on_position_closed = on_position_closed
-            self.web_socket_client.on_position_updated = on_position_updated
 
             logger.info("Bot initialized successfully")
 
@@ -122,7 +96,6 @@ class TradingBot:
         """Run the bot"""
         try:
             await self.initialize()
-            await self.web_socket_client.initialize()
 
             # Setup signal handlers
             loop = asyncio.get_event_loop()
@@ -134,17 +107,14 @@ class TradingBot:
 
             # Start trading
             trading_task = asyncio.create_task(self.start())
-            websocket_task = asyncio.create_task(self.web_socket_client.connect())
 
             # Wait for shutdown
             await self._shutdown_event.wait()
 
             # Cancel trading task
             trading_task.cancel()
-            websocket_task.cancel()
             try:
                 await trading_task
-                await websocket_task
             except asyncio.CancelledError:
                 pass
 
