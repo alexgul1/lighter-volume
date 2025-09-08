@@ -4,7 +4,6 @@ import time
 import uuid
 from typing import Set, Dict, Optional, Tuple, List
 import lighter
-from dataclasses import dataclass
 
 from src.config import Config
 from src.database import DatabaseManager, Transaction
@@ -13,23 +12,12 @@ from src.utils import setup_logger, Stats
 logger = setup_logger(__name__, Config.LOG_LEVEL)
 
 
-@dataclass
-class TPSLOrders:
-    """Track TP/SL orders for a position"""
-    tp_order_index: Optional[int] = None
-    sl_order_index: Optional[int] = None
-    tp_price: Optional[int] = None
-    sl_price: Optional[int] = None
-    tp_set: bool = False
-    sl_set: bool = False
-
-
 class Position:
-    """Represents a single position with TP/SL support"""
+    """Represents a single position"""
 
     def __init__(self, position_id: str, token: str, position_type: str,
                  is_long: bool, base_amount: int, amount_usdc: float,
-                 open_order_index: int, open_tx_id: int, entry_price: int):
+                 open_order_index: int, open_tx_id: int):
         self.position_id = position_id
         self.token = token
         self.position_type = position_type
@@ -38,15 +26,14 @@ class Position:
         self.amount_usdc = amount_usdc
         self.open_order_index = open_order_index
         self.open_tx_id = open_tx_id
-        self.entry_price = entry_price  # Store entry price for TP/SL calculation
         self.open_time = time.time()
-        self.is_closing = False
-        self.tp_sl_orders = TPSLOrders()  # Track TP/SL orders
+        self.is_closing = False  # Flag to prevent double closing
 
 
 class TradingEngine:
     """
-    Futures trading engine with TP/SL support for Lighter Protocol.
+    Futures trading engine for Lighter Protocol.
+    Supports multiple concurrent positions per token.
     """
 
     def __init__(self, db_manager: DatabaseManager):
@@ -55,9 +42,9 @@ class TradingEngine:
         self.api_client = None
         self.transaction_api = None
 
-        # Trading state
-        self.active_positions: Dict[str, Position] = {}
-        self.positions_by_token: Dict[str, List[str]] = {}
+        # Trading state - now supports multiple positions per token
+        self.active_positions: Dict[str, Position] = {}  # position_id -> Position
+        self.positions_by_token: Dict[str, List[str]] = {}  # token -> list of position_ids
         self.running = False
         self.stats = Stats()
 
@@ -68,9 +55,6 @@ class TradingEngine:
         # Track nonces
         self.current_nonce = 0
         self._nonce_lock = asyncio.Lock()
-
-        # Per-token cooldown tracking
-        self.token_last_close_time: Dict[str, float] = {}
 
     async def initialize(self):
         """Initialize Lighter client"""
@@ -103,9 +87,9 @@ class TradingEngine:
             # Set leverage for all markets
             await self._set_leverage_for_markets()
 
-            logger.info(f"Trading engine initialized with TP/SL support")
-            logger.info(f"TP: {Config.TP_PERCENT * 100:.3f}%, SL: {Config.SL_PERCENT * 100:.3f}%")
-            logger.info(f"Per-token cooldown: {Config.DELAY_BETWEEN_TRADES}s")
+            logger.info(f"Trading engine initialized (Account type: {Config.ACCOUNT_TYPE})")
+            logger.info(f"Default leverage: {Config.DEFAULT_LEVERAGE}x")
+            logger.info(f"Multiple positions per token: ENABLED")
 
         except Exception as e:
             logger.error(f"Failed to initialize: {e}")
@@ -119,12 +103,15 @@ class TradingEngine:
                 continue
 
             try:
+                # Calculate Initial Margin Fraction (IMF) from leverage
+                # IMF = 10000 / leverage (as per signer_client.py)
                 imf = int(10000 / Config.DEFAULT_LEVERAGE)
 
+                # Sign leverage update
                 tx_info, error = self.client.sign_update_leverage(
                     market_index=market_index,
                     fraction=imf,
-                    margin_mode=self.client.CROSS_MARGIN_MODE,
+                    margin_mode=self.client.CROSS_MARGIN_MODE,  # Use cross margin
                     nonce=await self.get_next_nonce()
                 )
 
@@ -132,13 +119,14 @@ class TradingEngine:
                     logger.error(f"Failed to sign leverage update for {token}: {error}")
                     continue
 
+                # Send transaction
                 result = await self.transaction_api.send_tx(
                     tx_type=self.client.TX_TYPE_UPDATE_LEVERAGE,
                     tx_info=tx_info
                 )
 
                 logger.info(f"Set leverage {Config.DEFAULT_LEVERAGE}x for {token}")
-                await asyncio.sleep(1)
+                await asyncio.sleep(1)  # Small delay between leverage updates
 
             except Exception as e:
                 logger.error(f"Failed to set leverage for {token}: {e}")
@@ -164,153 +152,15 @@ class TradingEngine:
             self.current_nonce += 1
             return nonce
 
-    async def _set_tp_sl_orders(self, position: Position, market_index: int):
-        """Set TP and SL orders for a position"""
-        try:
-            # Calculate TP/SL prices based on entry price and configured percentages
-            if position.is_long:
-                tp_price = int(position.entry_price * (1 + Config.TP_PERCENT))
-                sl_price = int(position.entry_price * (1 - Config.SL_PERCENT))
-            else:
-                tp_price = int(position.entry_price * (1 - Config.TP_PERCENT))
-                sl_price = int(position.entry_price * (1 + Config.SL_PERCENT))
-
-            position.tp_sl_orders.tp_price = tp_price
-            position.tp_sl_orders.sl_price = sl_price
-
-            # Create TP order
-            tp_order_index = await self.get_next_order_index()
-            tp_tx_info, tp_error = self.client.sign_create_order(
-                market_index=market_index,
-                client_order_index=tp_order_index,
-                base_amount=position.base_amount,
-                price=tp_price,
-                is_ask=position.is_long,  # Sell for long TP, buy for short TP
-                order_type=self.client.ORDER_TYPE_TAKE_PROFIT_LIMIT,
-                time_in_force=self.client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
-                reduce_only=True,
-                trigger_price=tp_price,
-                order_expiry=int(time.time() + 86400),  # 24 hour expiry
-                nonce=await self.get_next_nonce()
-            )
-
-            if not tp_error:
-                tp_result = await self.transaction_api.send_tx(
-                    tx_type=self.client.TX_TYPE_CREATE_ORDER,
-                    tx_info=tp_tx_info
-                )
-                position.tp_sl_orders.tp_order_index = tp_order_index
-                position.tp_sl_orders.tp_set = True
-                logger.info(f"✅ Set TP for {position.token} at {tp_price} (entry: {position.entry_price})")
-
-            # Small delay between orders to avoid rate limits
-            await asyncio.sleep(1)
-
-            # Create SL order
-            sl_order_index = await self.get_next_order_index()
-            sl_tx_info, sl_error = self.client.sign_create_order(
-                market_index=market_index,
-                client_order_index=sl_order_index,
-                base_amount=position.base_amount,
-                price=sl_price,
-                is_ask=position.is_long,  # Sell for long SL, buy for short SL
-                order_type=self.client.ORDER_TYPE_STOP_LOSS_LIMIT,
-                time_in_force=self.client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
-                reduce_only=True,
-                trigger_price=sl_price,
-                order_expiry=int(time.time() + 86400),
-                nonce=await self.get_next_nonce()
-            )
-
-            if not sl_error:
-                sl_result = await self.transaction_api.send_tx(
-                    tx_type=self.client.TX_TYPE_CREATE_ORDER,
-                    tx_info=sl_tx_info
-                )
-                position.tp_sl_orders.sl_order_index = sl_order_index
-                position.tp_sl_orders.sl_set = True
-                logger.info(f"✅ Set SL for {position.token} at {sl_price} (entry: {position.entry_price})")
-
-        except Exception as e:
-            logger.error(f"Failed to set TP/SL for position {position.position_id}: {e}")
-
-    async def _cancel_tp_sl_orders(self, position: Position, market_index: int):
-        """Cancel TP/SL orders before closing position"""
-        try:
-            # Cancel TP order if exists
-            if position.tp_sl_orders.tp_set and position.tp_sl_orders.tp_order_index:
-                tp_cancel_info, tp_error = self.client.sign_cancel_order(
-                    market_index=market_index,
-                    order_index=position.tp_sl_orders.tp_order_index,
-                    nonce=await self.get_next_nonce()
-                )
-                if not tp_error:
-                    await self.transaction_api.send_tx(
-                        tx_type=self.client.TX_TYPE_CANCEL_ORDER,
-                        tx_info=tp_cancel_info
-                    )
-                    logger.info(f"Cancelled TP order for {position.token}")
-
-            # Small delay
-            await asyncio.sleep(0.5)
-
-            # Cancel SL order if exists
-            if position.tp_sl_orders.sl_set and position.tp_sl_orders.sl_order_index:
-                sl_cancel_info, sl_error = self.client.sign_cancel_order(
-                    market_index=market_index,
-                    order_index=position.tp_sl_orders.sl_order_index,
-                    nonce=await self.get_next_nonce()
-                )
-                if not sl_error:
-                    await self.transaction_api.send_tx(
-                        tx_type=self.client.TX_TYPE_CANCEL_ORDER,
-                        tx_info=sl_cancel_info
-                    )
-                    logger.info(f"Cancelled SL order for {position.token}")
-
-        except Exception as e:
-            logger.error(f"Failed to cancel TP/SL orders: {e}")
-
-    async def _can_open_position_for_token(self, token: str) -> bool:
-        """Check if cooldown period has passed for token"""
-        last_close = self.token_last_close_time.get(token, 0)
-        time_since_close = time.time() - last_close
-        return time_since_close >= Config.DELAY_BETWEEN_TRADES
-
     async def start(self):
         """Start trading bot"""
         self.running = True
-        logger.info("🚀 Futures trading bot started with TP/SL")
+        logger.info("🚀 Futures trading bot started")
         logger.info(f"Tokens: {Config.TRADING_TOKENS}")
         logger.info(f"Position size: ${Config.MIN_TRADE_AMOUNT} - ${Config.MAX_TRADE_AMOUNT}")
+        logger.info(f"Hold time: {Config.POSITION_HOLD_TIME_MIN}-{Config.POSITION_HOLD_TIME_MAX}s")
 
-        # Start position monitor for time-based closing
-        monitor_task = asyncio.create_task(self._position_monitor())
-
-        try:
-            await self._trading_loop()
-        finally:
-            monitor_task.cancel()
-
-    async def _position_monitor(self):
-        """Monitor positions for time-based closing"""
-        while self.running:
-            try:
-                current_time = time.time()
-
-                for position_id, position in list(self.active_positions.items()):
-                    if position.is_closing:
-                        continue
-
-                    # Check if exceeded max hold time
-                    if current_time - position.open_time >= Config.MAX_HOLD_SECONDS:
-                        logger.info(f"⏰ Max hold time reached for {position.token} position {position_id}")
-                        asyncio.create_task(self._close_position(position_id))
-
-                await asyncio.sleep(5)  # Check every 5 seconds
-
-            except Exception as e:
-                logger.error(f"Position monitor error: {e}")
+        await self._trading_loop()
 
     async def stop(self):
         """Stop trading bot"""
@@ -319,69 +169,77 @@ class TradingEngine:
         # Close all open positions
         if self.active_positions:
             logger.info(f"Closing {len(self.active_positions)} open positions...")
-            for position_id in list(self.active_positions.keys()):
-                await self._close_position(position_id)
-                await asyncio.sleep(2)  # Delay between closes
+            close_tasks = []
+            for position_id, position in self.active_positions.items():
+                if not position.is_closing:
+                    close_tasks.append(self._close_position(position_id))
+            if close_tasks:
+                await asyncio.gather(*close_tasks, return_exceptions=True)
 
         logger.info("Trading bot stopped")
         logger.info(self.stats.get_stats_string())
 
     async def _trading_loop(self):
-        """Main trading loop with per-token cooldowns"""
+        """Main trading loop"""
         while self.running:
             try:
-                # Find tokens available for trading (not in cooldown)
-                available_tokens = []
-                for token in Config.TRADING_TOKENS:
-                    if await self._can_open_position_for_token(token):
-                        # Check position limit
-                        token_positions = len(self.positions_by_token.get(token, []))
-                        if token_positions < Config.MAX_POSITIONS_PER_TOKEN:
-                            available_tokens.append(token)
+                # We can now open positions for any token, even if it has existing positions
+                token = random.choice(Config.TRADING_TOKENS)
 
-                if available_tokens:
-                    token = random.choice(available_tokens)
-                    await self._open_position(token)
+                # Open a new position
+                await self._open_position(token)
 
-                    # Wait minimum time between any trades
-                    await asyncio.sleep(Config.SAFE_DELAY_BETWEEN_TRADES)
-                else:
-                    # No tokens available, wait
-                    await asyncio.sleep(1)
+                # Wait before next trade
+                await asyncio.sleep(Config.DELAY_BETWEEN_TRADES)
 
             except Exception as e:
                 logger.error(f"Trading loop error: {e}")
                 await asyncio.sleep(5)
 
     async def _open_position(self, token: str):
-        """Open a position and set TP/SL"""
+        """Open a long or short position"""
+
+        # Get market index
         market_index = Config.MARKET_INDICES.get(token)
         if market_index is None:
+            logger.error(f"Unknown market for token {token}")
             return
 
+        # Generate unique position ID
         position_id = str(uuid.uuid4())[:8]
+
+        # Random position type
         is_long = random.choice([True, False])
         position_type = "long" if is_long else "short"
-        amount_usdc = round(random.uniform(Config.MIN_TRADE_AMOUNT, Config.MAX_TRADE_AMOUNT), 2)
+
+        # Random amount in USDC
+        amount_usdc = round(random.uniform(
+            Config.MIN_TRADE_AMOUNT,
+            Config.MAX_TRADE_AMOUNT
+        ), 2)
+
+        # Calculate base amount
         base_amount = int(amount_usdc)
 
-        # Use a reasonable entry price for calculation (you might want to fetch current price)
-        # For now, using a placeholder
-        entry_price = 100000  # This should be fetched from market data
-
+        # Calculate price with max slippage
         if is_long:
-            price = 999999999  # Max slippage for market order
-            is_ask = False
+            price = 999999999  # Buy at any price
+            is_ask = False  # Buy to open long
         else:
-            price = 1
-            is_ask = True
+            price = 1  # Sell at any price
+            is_ask = True  # Sell to open short
 
         try:
-            logger.info(f"📈 Opening {position_type.upper()} {token}: ${amount_usdc} (ID: {position_id})")
+            # Count active positions for this token
+            token_positions = self.positions_by_token.get(token, [])
+            logger.info(f"📈 Opening {position_type.upper()} {token}: ${amount_usdc} "
+                        f"(ID: {position_id}, Active: {len(token_positions)})")
 
+            # Get order index and nonce
             order_index = await self.get_next_order_index()
             nonce = await self.get_next_nonce()
 
+            # Sign order
             tx_info, error = self.client.sign_create_order(
                 market_index=market_index,
                 client_order_index=order_index,
@@ -390,9 +248,9 @@ class TradingEngine:
                 is_ask=is_ask,
                 order_type=self.client.ORDER_TYPE_MARKET,
                 time_in_force=self.client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
-                reduce_only=False,
+                reduce_only=False,  # False for opening position
                 trigger_price=0,
-                order_expiry=0,
+                order_expiry=0,  # 0 for IOC
                 nonce=nonce
             )
 
@@ -400,12 +258,13 @@ class TradingEngine:
                 logger.error(f"Failed to sign open order: {error}")
                 return
 
+            # Send transaction
             result = await self.transaction_api.send_tx(
                 tx_type=self.client.TX_TYPE_CREATE_ORDER,
                 tx_info=tx_info
             )
 
-            # Log to database
+            # Log transaction
             tx = Transaction(
                 tx_type="open",
                 position_type=position_type,
@@ -419,7 +278,7 @@ class TradingEngine:
             )
             open_tx_id = await self.db.log_transaction(tx)
 
-            # Create position
+            # Create position object
             position = Position(
                 position_id=position_id,
                 token=token,
@@ -428,12 +287,13 @@ class TradingEngine:
                 base_amount=base_amount,
                 amount_usdc=amount_usdc,
                 open_order_index=order_index,
-                open_tx_id=open_tx_id,
-                entry_price=entry_price
+                open_tx_id=open_tx_id
             )
 
             # Store position
             self.active_positions[position_id] = position
+
+            # Update positions by token
             if token not in self.positions_by_token:
                 self.positions_by_token[token] = []
             self.positions_by_token[token].append(position_id)
@@ -441,53 +301,66 @@ class TradingEngine:
             logger.info(f"✅ Opened {position_type} {token} (ID: {position_id})")
             self.stats.add_position(True, amount_usdc, is_long)
 
-            # Set TP/SL orders after a short delay
-            await asyncio.sleep(1)
-            await self._set_tp_sl_orders(position, market_index)
-
-            # Schedule random hold time close (backup if TP/SL not hit)
-            hold_time = random.uniform(Config.POSITION_HOLD_TIME_MIN, Config.POSITION_HOLD_TIME_MAX)
+            # Schedule position close
+            hold_time = random.uniform(
+                Config.POSITION_HOLD_TIME_MIN,
+                Config.POSITION_HOLD_TIME_MAX
+            )
             asyncio.create_task(self._schedule_close_position(position_id, hold_time))
 
         except Exception as e:
-            logger.error(f"Failed to open position: {e}")
+            logger.error(f"Failed to open position for {token}: {e}")
+
+            # Log failed transaction
+            tx = Transaction(
+                tx_type="open",
+                position_type=position_type,
+                token=token,
+                amount_usdc=amount_usdc,
+                base_amount=base_amount,
+                price=price,
+                is_success=False,
+                error=str(e)
+            )
+            await self.db.log_transaction(tx)
 
     async def _schedule_close_position(self, position_id: str, hold_time: float):
-        """Schedule position close after hold time"""
+        """Schedule closing a specific position after hold time"""
         await asyncio.sleep(hold_time)
-        position = self.active_positions.get(position_id)
-        if position and not position.is_closing:
-            await self._close_position(position_id)
+        await self._close_position(position_id)
 
     async def _close_position(self, position_id: str):
-        """Close position (cancel TP/SL first)"""
+        """Close a specific position by ID"""
+
         position = self.active_positions.get(position_id)
         if not position or position.is_closing:
             return
 
+        # Mark as closing to prevent double closing
         position.is_closing = True
+
+        # Get market index
         market_index = Config.MARKET_INDICES.get(position.token)
         if market_index is None:
             return
 
-        # Cancel TP/SL orders first
-        await self._cancel_tp_sl_orders(position, market_index)
-        await asyncio.sleep(1)
-
-        # Close position
+        # For closing: reverse the side
         if position.is_long:
-            price = 1
+            price = 1  # Sell at any price
             is_ask = True
         else:
-            price = 999999999
+            price = 999999999  # Buy at any price
             is_ask = False
 
         try:
-            logger.info(f"📉 Closing {position.position_type.upper()} {position.token} (ID: {position_id})")
+            logger.info(f"📉 Closing {position.position_type.upper()} {position.token} "
+                        f"(ID: {position_id})")
 
+            # Get order index and nonce
             order_index = await self.get_next_order_index()
             nonce = await self.get_next_nonce()
 
+            # Sign order
             tx_info, error = self.client.sign_create_order(
                 market_index=market_index,
                 client_order_index=order_index,
@@ -496,35 +369,68 @@ class TradingEngine:
                 is_ask=is_ask,
                 order_type=self.client.ORDER_TYPE_MARKET,
                 time_in_force=self.client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
-                reduce_only=True,
+                reduce_only=True,  # True for closing position
                 trigger_price=0,
-                order_expiry=0,
+                order_expiry=0,  # 0 for IOC
                 nonce=nonce
             )
 
             if error:
                 logger.error(f"Failed to sign close order: {error}")
-                position.is_closing = False
+                position.is_closing = False  # Reset flag on error
                 return
 
+            # Send transaction
             result = await self.transaction_api.send_tx(
                 tx_type=self.client.TX_TYPE_CREATE_ORDER,
                 tx_info=tx_info
             )
 
-            # Update cooldown for this token
-            self.token_last_close_time[position.token] = time.time()
+            # Log transaction
+            tx = Transaction(
+                tx_type="close",
+                position_type=position.position_type,
+                token=position.token,
+                amount_usdc=position.amount_usdc,
+                base_amount=position.base_amount,
+                price=price,
+                is_success=True,
+                dependency=position.open_tx_id,
+                order_id=str(order_index),
+                tx_hash=str(result) if result else None
+            )
+            await self.db.log_transaction(tx)
 
-            # Remove from tracking
+            # Remove from active positions
             del self.active_positions[position_id]
+
+            # Remove from positions by token
             if position.token in self.positions_by_token:
                 self.positions_by_token[position.token].remove(position_id)
                 if not self.positions_by_token[position.token]:
                     del self.positions_by_token[position.token]
 
-            logger.info(f"✅ Closed {position.token} position (ID: {position_id})")
+            # Count remaining positions for this token
+            remaining = len(self.positions_by_token.get(position.token, []))
+
+            logger.info(f"✅ Closed {position.position_type} {position.token} "
+                        f"(ID: {position_id}, Remaining: {remaining})")
             logger.info(self.stats.get_stats_string())
 
         except Exception as e:
-            logger.error(f"Failed to close position: {e}")
-            position.is_closing = False
+            logger.error(f"Failed to close position {position_id}: {e}")
+            position.is_closing = False  # Reset flag on error
+
+            # Log failed transaction
+            tx = Transaction(
+                tx_type="close",
+                position_type=position.position_type,
+                token=position.token,
+                amount_usdc=position.amount_usdc,
+                base_amount=position.base_amount,
+                price=price,
+                is_success=False,
+                dependency=position.open_tx_id,
+                error=str(e)
+            )
+            await self.db.log_transaction(tx)

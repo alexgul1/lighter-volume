@@ -6,7 +6,7 @@ load_dotenv()
 
 
 class Config:
-    """Application configuration for futures trading with TP/SL support"""
+    """Application configuration for futures trading"""
 
     # Lighter API
     BASE_URL = os.getenv("LIGHTER_BASE_URL", "https://mainnet.zklighter.elliot.ai")
@@ -32,24 +32,15 @@ class Config:
     MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "lighter_bot")
     MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "transactions")
 
-    # Trading Parameters
+    # Trading
     MIN_TRADE_AMOUNT = float(os.getenv("MIN_TRADE_AMOUNT_USDC", "10.0"))
     MAX_TRADE_AMOUNT = float(os.getenv("MAX_TRADE_AMOUNT_USDC", "50.0"))
     TRADING_TOKENS: List[str] = os.getenv("TRADING_TOKENS", "ETH,BTC,SOL").split(",")
     DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "3"))
-    MAX_POSITIONS_PER_TOKEN = int(os.getenv("MAX_POSITIONS_PER_TOKEN", "3"))
 
-    # Take Profit / Stop Loss Configuration (as percentages)
-    # Examples: 0.001 = 0.1%, 0.01 = 1%, 0.00001 = 0.001%
-    TP_PERCENT = float(os.getenv("TP_PERCENT", "0.001"))  # 0.1% default
-    SL_PERCENT = float(os.getenv("SL_PERCENT", "0.001"))  # 0.1% default
-
-    # Position Timing
+    # Position timing
     POSITION_HOLD_TIME_MIN = float(os.getenv("POSITION_HOLD_TIME_MIN", "2"))
     POSITION_HOLD_TIME_MAX = float(os.getenv("POSITION_HOLD_TIME_MAX", "5"))
-    MAX_HOLD_SECONDS = float(os.getenv("MAX_HOLD_SECONDS", "300"))  # 5 minutes max
-
-    # Per-Token Cooldown (seconds after closing a position for that token)
     DELAY_BETWEEN_TRADES = float(os.getenv("DELAY_BETWEEN_TRADES", "3"))
 
     # Logging
@@ -65,12 +56,12 @@ class Config:
         "LINK": 5,
         "UNI": 6,
         "AAVE": 7,
-        "HYPE": 24
+        "HYPE": 24  # Added from your example
     }
 
     # Price scaling (Lighter uses integer prices with 2 decimal places)
     PRICE_SCALE = 100  # For price conversion
-    BASE_AMOUNT_SCALE = 1  # BaseAmount in smallest units
+    BASE_AMOUNT_SCALE = 1  # BaseAmount seems to be in smallest units
 
     @classmethod
     def validate(cls):
@@ -82,9 +73,3 @@ class Config:
         for token in cls.TRADING_TOKENS:
             if token not in cls.MARKET_INDICES:
                 raise ValueError(f"Unknown token: {token}")
-
-        # Validate TP/SL percentages
-        if cls.TP_PERCENT < 0.00001 or cls.TP_PERCENT > 1:
-            raise ValueError("TP_PERCENT must be between 0.00001 and 1")
-        if cls.SL_PERCENT < 0.00001 or cls.SL_PERCENT > 1:
-            raise ValueError("SL_PERCENT must be between 0.00001 and 1")
