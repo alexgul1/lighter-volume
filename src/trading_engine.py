@@ -442,7 +442,7 @@ class TradingEngine:
             self.stats.add_position(True, amount_usdc, is_long)
 
             # Set TP/SL orders after a short delay
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
             await self._set_tp_sl_orders(position, market_index)
 
             # Schedule random hold time close (backup if TP/SL not hit)
@@ -482,49 +482,66 @@ class TradingEngine:
             price = 999999999
             is_ask = False
 
-        try:
-            logger.info(f"📉 Closing {position.position_type.upper()} {position.token} (ID: {position_id})")
+        retry_count = 0
+        max_retries = 3
 
-            order_index = await self.get_next_order_index()
-            nonce = await self.get_next_nonce()
+        while retry_count < max_retries:
+            try:
+                logger.info(f"📉 Closing {position.position_type.upper()} {position.token} (ID: {position_id})")
 
-            tx_info, error = self.client.sign_create_order(
-                market_index=market_index,
-                client_order_index=order_index,
-                base_amount=position.base_amount,
-                price=price,
-                is_ask=is_ask,
-                order_type=self.client.ORDER_TYPE_MARKET,
-                time_in_force=self.client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
-                reduce_only=True,
-                trigger_price=0,
-                order_expiry=0,
-                nonce=nonce
-            )
+                order_index = await self.get_next_order_index()
+                nonce = await self.get_next_nonce()
 
-            if error:
-                logger.error(f"Failed to sign close order: {error}")
-                position.is_closing = False
-                return
+                tx_info, error = self.client.sign_create_order(
+                    market_index=market_index,
+                    client_order_index=order_index,
+                    base_amount=position.base_amount,
+                    price=price,
+                    is_ask=is_ask,
+                    order_type=self.client.ORDER_TYPE_MARKET,
+                    time_in_force=self.client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+                    reduce_only=True,
+                    trigger_price=0,
+                    order_expiry=0,
+                    nonce=nonce
+                )
 
-            result = await self.transaction_api.send_tx(
-                tx_type=self.client.TX_TYPE_CREATE_ORDER,
-                tx_info=tx_info
-            )
+                if error:
+                    logger.error(f"Failed to sign close order: {error}")
+                    position.is_closing = False
+                    return
 
-            # Update cooldown for this token
-            self.token_last_close_time[position.token] = time.time()
+                result = await self.transaction_api.send_tx(
+                    tx_type=self.client.TX_TYPE_CREATE_ORDER,
+                    tx_info=tx_info
+                )
 
-            # Remove from tracking
-            del self.active_positions[position_id]
-            if position.token in self.positions_by_token:
-                self.positions_by_token[position.token].remove(position_id)
-                if not self.positions_by_token[position.token]:
-                    del self.positions_by_token[position.token]
+                # Success - update tracking
+                self.token_last_close_time[position.token] = time.time()
 
-            logger.info(f"✅ Closed {position.token} position (ID: {position_id})")
-            logger.info(self.stats.get_stats_string())
+                # Remove from tracking
+                del self.active_positions[position_id]
+                if position.token in self.positions_by_token:
+                    self.positions_by_token[position.token].remove(position_id)
+                    if not self.positions_by_token[position.token]:
+                        del self.positions_by_token[position.token]
 
-        except Exception as e:
-            logger.error(f"Failed to close position: {e}")
+                logger.info(f"✅ Closed {position.token} position (ID: {position_id})")
+                logger.info(self.stats.get_stats_string())
+                break  # Success, exit retry loop
+
+            except Exception as e:
+                error_msg = str(e)
+                if "invalid nonce" in error_msg:
+                    logger.warning(f"Invalid nonce detected, resyncing... (attempt {retry_count + 1}/{max_retries})")
+                    await self.resync_nonce()
+                    retry_count += 1
+                    await asyncio.sleep(1)
+                else:
+                    logger.error(f"Failed to close position: {e}")
+                    position.is_closing = False
+                    break
+
+        if retry_count >= max_retries:
+            logger.error(f"Failed to close position after {max_retries} retries")
             position.is_closing = False
