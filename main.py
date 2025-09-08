@@ -44,14 +44,6 @@ async def main():
     client.on_position_closed = on_position_closed
     client.on_position_updated = on_position_updated
 
-    try:
-        await bot.run()
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        sys.exit(1)
-
     # Initialize and connect
     try:
         await client.initialize()
@@ -61,7 +53,13 @@ async def main():
     except Exception as e:
         logger.error(f"Fatal error: {e}")
 
-
+    try:
+        await bot.run()
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
