@@ -43,6 +43,10 @@ class Config:
     POSITION_HOLD_TIME_MAX = float(os.getenv("POSITION_HOLD_TIME_MAX", "5"))
     DELAY_BETWEEN_TRADES = float(os.getenv("DELAY_BETWEEN_TRADES", "3"))
 
+    # Error handling and recovery
+    MAX_CONSECUTIVE_FAILURES = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "7"))  # 5-10 range, default 7
+    PAUSE_DURATION_SECONDS = int(os.getenv("PAUSE_DURATION_SECONDS", "60"))  # 1 minute pause
+
     # Logging
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
