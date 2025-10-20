@@ -141,6 +141,41 @@ class TradingEngine:
         if self.api_client:
             await self.api_client.close()
 
+    async def full_restart(self):
+        """Perform full restart: close everything and reinitialize"""
+        logger.info("🔄 Starting full bot restart...")
+
+        # Close all open positions first
+        if self.active_positions:
+            logger.info(f"Closing {len(self.active_positions)} open positions before restart...")
+            close_tasks = []
+            for position_id, position in list(self.active_positions.items()):
+                if not position.is_closing:
+                    close_tasks.append(self._close_position(position_id))
+            if close_tasks:
+                await asyncio.gather(*close_tasks, return_exceptions=True)
+
+        # Cleanup old connections
+        logger.info("Cleaning up old connections...")
+        await self.cleanup()
+
+        # Wait a bit for cleanup to complete
+        await asyncio.sleep(2)
+
+        # Clear state
+        self.active_positions.clear()
+        self.positions_by_token.clear()
+        self.consecutive_failures = 0
+        self.client = None
+        self.api_client = None
+        self.transaction_api = None
+
+        # Reinitialize everything
+        logger.info("Reinitializing Lighter client...")
+        await self.initialize()
+
+        logger.info("✅ Full restart completed successfully")
+
     async def get_next_order_index(self) -> int:
         """Get unique order index"""
         async with self._order_index_lock:
@@ -186,17 +221,23 @@ class TradingEngine:
         """Main trading loop with automatic recovery on consecutive failures"""
         while self.running:
             try:
-                # Check if we need to pause and restart due to consecutive failures
+                # Check if we need to pause and perform full restart due to consecutive failures
                 if self.consecutive_failures >= Config.MAX_CONSECUTIVE_FAILURES:
                     logger.error(f"🛑 Reached {self.consecutive_failures} consecutive failures!")
-                    logger.info(f"⏸️  Pausing for {Config.PAUSE_DURATION_SECONDS} seconds before restart...")
+                    logger.info(f"⏸️  Pausing for {Config.PAUSE_DURATION_SECONDS} seconds before full restart...")
 
                     # Pause
                     await asyncio.sleep(Config.PAUSE_DURATION_SECONDS)
 
-                    # Reset counter and restart
-                    self.consecutive_failures = 0
-                    logger.info("🔄 Restarting trading after pause...")
+                    # Perform full restart (close positions, cleanup, reinitialize)
+                    try:
+                        await self.full_restart()
+                    except Exception as restart_error:
+                        logger.error(f"Failed to restart: {restart_error}")
+                        # If restart fails, wait a bit and try to continue anyway
+                        await asyncio.sleep(10)
+                        self.consecutive_failures = 0
+
                     continue
 
                 # We can now open positions for any token, even if it has existing positions
