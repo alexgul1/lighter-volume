@@ -56,6 +56,9 @@ class TradingEngine:
         self.current_nonce = 0
         self._nonce_lock = asyncio.Lock()
 
+        # Error tracking for automatic recovery
+        self.consecutive_failures = 0
+
     async def initialize(self):
         """Initialize Lighter client"""
         try:
@@ -180,9 +183,22 @@ class TradingEngine:
         logger.info(self.stats.get_stats_string())
 
     async def _trading_loop(self):
-        """Main trading loop"""
+        """Main trading loop with automatic recovery on consecutive failures"""
         while self.running:
             try:
+                # Check if we need to pause and restart due to consecutive failures
+                if self.consecutive_failures >= Config.MAX_CONSECUTIVE_FAILURES:
+                    logger.error(f"🛑 Reached {self.consecutive_failures} consecutive failures!")
+                    logger.info(f"⏸️  Pausing for {Config.PAUSE_DURATION_SECONDS} seconds before restart...")
+
+                    # Pause
+                    await asyncio.sleep(Config.PAUSE_DURATION_SECONDS)
+
+                    # Reset counter and restart
+                    self.consecutive_failures = 0
+                    logger.info("🔄 Restarting trading after pause...")
+                    continue
+
                 # We can now open positions for any token, even if it has existing positions
                 token = random.choice(Config.TRADING_TOKENS)
 
@@ -256,6 +272,23 @@ class TradingEngine:
 
             if error:
                 logger.error(f"Failed to sign open order: {error}")
+
+                # Increment consecutive failures counter
+                self.consecutive_failures += 1
+                logger.warning(f"Consecutive failures: {self.consecutive_failures}/{Config.MAX_CONSECUTIVE_FAILURES}")
+
+                # Log failed transaction
+                tx = Transaction(
+                    tx_type="open",
+                    position_type=position_type,
+                    token=token,
+                    amount_usdc=amount_usdc,
+                    base_amount=base_amount,
+                    price=price,
+                    is_success=False,
+                    error=f"Sign error: {error}"
+                )
+                await self.db.log_transaction(tx)
                 return
 
             # Send transaction
@@ -301,6 +334,9 @@ class TradingEngine:
             logger.info(f"✅ Opened {position_type} {token} (ID: {position_id})")
             self.stats.add_position(True, amount_usdc, is_long)
 
+            # Reset consecutive failures on success
+            self.consecutive_failures = 0
+
             # Schedule position close
             hold_time = random.uniform(
                 Config.POSITION_HOLD_TIME_MIN,
@@ -310,6 +346,10 @@ class TradingEngine:
 
         except Exception as e:
             logger.error(f"Failed to open position for {token}: {e}")
+
+            # Increment consecutive failures counter
+            self.consecutive_failures += 1
+            logger.warning(f"Consecutive failures: {self.consecutive_failures}/{Config.MAX_CONSECUTIVE_FAILURES}")
 
             # Log failed transaction
             tx = Transaction(
