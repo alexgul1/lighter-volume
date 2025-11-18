@@ -2,7 +2,8 @@ import asyncio
 import random
 import time
 import uuid
-from typing import Set, Dict, Optional, Tuple, List
+from typing import Dict, Optional, List, Tuple
+from dataclasses import dataclass
 import lighter
 
 from src.config import Config
@@ -12,12 +13,24 @@ from src.utils import setup_logger, Stats
 logger = setup_logger(__name__, Config.LOG_LEVEL)
 
 
+@dataclass
+class MarketData:
+    """Market data from order book details"""
+    symbol: str
+    market_id: int
+    last_trade_price: float
+    open_interest: float
+    size_decimals: int
+    price_decimals: int
+
+
 class Position:
-    """Represents a single position"""
+    """Represents a single position in the hedged trading strategy"""
 
     def __init__(self, position_id: str, token: str, position_type: str,
                  is_long: bool, base_amount: int, amount_usdc: float,
-                 open_order_index: int, open_tx_id: int):
+                 open_order_index: int, open_tx_id: int, account_num: int,
+                 entry_price: float):
         self.position_id = position_id
         self.token = token
         self.position_type = position_type
@@ -26,120 +39,299 @@ class Position:
         self.amount_usdc = amount_usdc
         self.open_order_index = open_order_index
         self.open_tx_id = open_tx_id
+        self.account_num = account_num  # 1 or 2
+        self.entry_price = entry_price
         self.open_time = time.time()
         self.is_closing = False  # Flag to prevent double closing
+        self.paired_position_id: Optional[str] = None  # ID of the hedged pair
 
 
 class TradingEngine:
     """
-    Futures trading engine for Lighter Protocol.
-    Supports multiple concurrent positions per token.
+    Hedged futures trading engine for Lighter Protocol.
+    Opens opposing positions (long/short) across two accounts to hedge risk
+    while maximizing farming rewards on low OI tokens.
     """
 
     def __init__(self, db_manager: DatabaseManager):
         self.db = db_manager
-        self.client: Optional[lighter.SignerClient] = None
+
+        # Dual account support
+        self.client_1: Optional[lighter.SignerClient] = None
+        self.client_2: Optional[lighter.SignerClient] = None
         self.api_client = None
         self.transaction_api = None
+        self.order_api = None
 
-        # Trading state - now supports multiple positions per token
+        # Trading state
         self.active_positions: Dict[str, Position] = {}  # position_id -> Position
         self.positions_by_token: Dict[str, List[str]] = {}  # token -> list of position_ids
         self.running = False
         self.stats = Stats()
 
-        # Track order indices
-        self.next_order_index = 1000
+        # Market data cache
+        self.market_data_cache: Dict[str, MarketData] = {}  # token -> MarketData
+        self.cache_timestamp = 0
+        self.cache_ttl = 30  # Cache market data for 30 seconds
+
+        # Track order indices per account
+        self.next_order_index_1 = 1000
+        self.next_order_index_2 = 2000
         self._order_index_lock = asyncio.Lock()
 
-        # Track nonces
-        self.current_nonce = 0
+        # Track nonces per account
+        self.current_nonce_1 = 0
+        self.current_nonce_2 = 0
         self._nonce_lock = asyncio.Lock()
 
         # Error tracking for automatic recovery
         self.consecutive_failures = 0
 
     async def initialize(self):
-        """Initialize Lighter client"""
+        """Initialize Lighter clients for dual account hedging"""
         try:
             # Initialize API client
             configuration = lighter.Configuration(Config.BASE_URL)
             self.api_client = lighter.ApiClient(configuration)
             self.transaction_api = lighter.TransactionApi(self.api_client)
+            self.order_api = lighter.OrderApi(self.api_client)
 
-            # Initialize signer client
-            self.client = lighter.SignerClient(
+            # Initialize Account 1 (Primary)
+            self.client_1 = lighter.SignerClient(
                 url=Config.BASE_URL,
-                private_key=Config.API_KEY_PRIVATE_KEY,
-                account_index=Config.ACCOUNT_INDEX,
-                api_key_index=Config.API_KEY_INDEX
+                private_key=Config.ACCOUNT_1_PRIVATE_KEY,
+                account_index=Config.ACCOUNT_1_INDEX,
+                api_key_index=Config.ACCOUNT_1_API_KEY_INDEX
             )
 
-            # Check client
-            err = self.client.check_client()
+            # Check Account 1
+            err = self.client_1.check_client()
             if err is not None:
-                raise Exception(f"Client check failed: {err}")
+                raise Exception(f"Account 1 client check failed: {err}")
 
-            # Get initial nonce
-            next_nonce = await self.transaction_api.next_nonce(
-                account_index=Config.ACCOUNT_INDEX,
-                api_key_index=Config.API_KEY_INDEX
+            # Get initial nonce for Account 1
+            next_nonce_1 = await self.transaction_api.next_nonce(
+                account_index=Config.ACCOUNT_1_INDEX,
+                api_key_index=Config.ACCOUNT_1_API_KEY_INDEX
             )
-            self.current_nonce = next_nonce.nonce
+            self.current_nonce_1 = next_nonce_1.nonce
 
-            # Set leverage for all markets
+            # Initialize Account 2 (Secondary)
+            self.client_2 = lighter.SignerClient(
+                url=Config.BASE_URL,
+                private_key=Config.ACCOUNT_2_PRIVATE_KEY,
+                account_index=Config.ACCOUNT_2_INDEX,
+                api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
+            )
+
+            # Check Account 2
+            err = self.client_2.check_client()
+            if err is not None:
+                raise Exception(f"Account 2 client check failed: {err}")
+
+            # Get initial nonce for Account 2
+            next_nonce_2 = await self.transaction_api.next_nonce(
+                account_index=Config.ACCOUNT_2_INDEX,
+                api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
+            )
+            self.current_nonce_2 = next_nonce_2.nonce
+
+            # Set leverage for all markets on both accounts
             await self._set_leverage_for_markets()
 
-            logger.info(f"Trading engine initialized (Account type: {Config.ACCOUNT_TYPE})")
-            logger.info(f"Default leverage: {Config.DEFAULT_LEVERAGE}x")
-            logger.info(f"Multiple positions per token: ENABLED")
+            logger.info(f"🎯 Hedged trading engine initialized")
+            logger.info(f"Account 1: Index {Config.ACCOUNT_1_INDEX}")
+            logger.info(f"Account 2: Index {Config.ACCOUNT_2_INDEX}")
+            logger.info(f"Leverage: {Config.DEFAULT_LEVERAGE}x")
+            logger.info(f"Strategy: Dual account hedging (long/short pairs)")
 
         except Exception as e:
             logger.error(f"Failed to initialize: {e}")
             raise
 
     async def _set_leverage_for_markets(self):
-        """Set leverage for all trading markets"""
+        """Set leverage for all trading markets on both accounts"""
+        imf = int(10000 / Config.DEFAULT_LEVERAGE)
+
         for token in Config.TRADING_TOKENS:
             market_index = Config.MARKET_INDICES.get(token)
             if market_index is None:
                 continue
 
             try:
-                # Calculate Initial Margin Fraction (IMF) from leverage
-                # IMF = 10000 / leverage (as per signer_client.py)
-                imf = int(10000 / Config.DEFAULT_LEVERAGE)
-
-                # Sign leverage update
-                tx_info, error = self.client.sign_update_leverage(
+                # Set leverage on Account 1
+                tx_info_1, error_1 = self.client_1.sign_update_leverage(
                     market_index=market_index,
                     fraction=imf,
-                    margin_mode=self.client.CROSS_MARGIN_MODE,  # Use cross margin
-                    nonce=await self.get_next_nonce()
+                    margin_mode=self.client_1.CROSS_MARGIN_MODE,
+                    nonce=await self.get_next_nonce(account_num=1)
                 )
 
-                if error:
-                    logger.error(f"Failed to sign leverage update for {token}: {error}")
-                    continue
+                if error_1:
+                    logger.error(f"Failed to sign leverage update for {token} on Account 1: {error_1}")
+                else:
+                    await self.transaction_api.send_tx(
+                        tx_type=self.client_1.TX_TYPE_UPDATE_LEVERAGE,
+                        tx_info=tx_info_1
+                    )
+                    logger.info(f"Set leverage {Config.DEFAULT_LEVERAGE}x for {token} on Account 1")
 
-                # Send transaction
-                result = await self.transaction_api.send_tx(
-                    tx_type=self.client.TX_TYPE_UPDATE_LEVERAGE,
-                    tx_info=tx_info
+                await asyncio.sleep(0.5)
+
+                # Set leverage on Account 2
+                tx_info_2, error_2 = self.client_2.sign_update_leverage(
+                    market_index=market_index,
+                    fraction=imf,
+                    margin_mode=self.client_2.CROSS_MARGIN_MODE,
+                    nonce=await self.get_next_nonce(account_num=2)
                 )
 
-                logger.info(f"Set leverage {Config.DEFAULT_LEVERAGE}x for {token}")
-                await asyncio.sleep(1)  # Small delay between leverage updates
+                if error_2:
+                    logger.error(f"Failed to sign leverage update for {token} on Account 2: {error_2}")
+                else:
+                    await self.transaction_api.send_tx(
+                        tx_type=self.client_2.TX_TYPE_UPDATE_LEVERAGE,
+                        tx_info=tx_info_2
+                    )
+                    logger.info(f"Set leverage {Config.DEFAULT_LEVERAGE}x for {token} on Account 2")
+
+                await asyncio.sleep(0.5)
 
             except Exception as e:
                 logger.error(f"Failed to set leverage for {token}: {e}")
 
     async def cleanup(self):
         """Cleanup resources"""
-        if self.client:
-            await self.client.close()
+        if self.client_1:
+            await self.client_1.close()
+        if self.client_2:
+            await self.client_2.close()
         if self.api_client:
             await self.api_client.close()
+
+    async def get_market_data(self, token: str, force_refresh: bool = False) -> Optional[MarketData]:
+        """
+        Get market data including price and open interest for a token.
+        Uses caching to reduce API calls.
+        """
+        # Check cache
+        current_time = time.time()
+        if not force_refresh and token in self.market_data_cache:
+            if current_time - self.cache_timestamp < self.cache_ttl:
+                return self.market_data_cache[token]
+
+        # Fetch from API
+        market_index = Config.MARKET_INDICES.get(token)
+        if market_index is None:
+            logger.error(f"Unknown market for token {token}")
+            return None
+
+        try:
+            # Get order book details
+            details_response = await self.order_api.order_book_details(market_id=market_index)
+
+            if not details_response.order_book_details:
+                logger.error(f"No order book details for {token}")
+                return None
+
+            detail = details_response.order_book_details[0]
+
+            market_data = MarketData(
+                symbol=detail.symbol,
+                market_id=detail.market_id,
+                last_trade_price=detail.last_trade_price,
+                open_interest=detail.open_interest,
+                size_decimals=detail.size_decimals,
+                price_decimals=detail.price_decimals
+            )
+
+            # Update cache
+            self.market_data_cache[token] = market_data
+            self.cache_timestamp = current_time
+
+            return market_data
+
+        except Exception as e:
+            logger.error(f"Failed to get market data for {token}: {e}")
+            return None
+
+    async def get_all_market_data(self) -> Dict[str, MarketData]:
+        """Get market data for all trading tokens"""
+        market_data = {}
+        for token in Config.TRADING_TOKENS:
+            data = await self.get_market_data(token, force_refresh=True)
+            if data:
+                market_data[token] = data
+            await asyncio.sleep(0.1)  # Small delay between requests
+        return market_data
+
+    async def select_low_oi_tokens(self) -> List[str]:
+        """
+        Select tokens with low open interest for better farming rewards.
+        Returns list of token symbols sorted by OI (lowest first).
+        """
+        if not Config.ENABLE_LOW_OI_FILTER:
+            return Config.TRADING_TOKENS
+
+        market_data = await self.get_all_market_data()
+
+        # Filter and sort by open interest
+        low_oi_tokens = []
+        for token, data in market_data.items():
+            if data.open_interest <= Config.MAX_OPEN_INTEREST_THRESHOLD:
+                low_oi_tokens.append((token, data.open_interest))
+
+        # Sort by OI (lowest first)
+        low_oi_tokens.sort(key=lambda x: x[1])
+
+        # Extract token symbols
+        selected_tokens = [token for token, _ in low_oi_tokens]
+
+        # If we don't have enough tokens, add remaining ones
+        if len(selected_tokens) < Config.MIN_MARKETS_FOR_OI_FILTER:
+            remaining = [t for t in Config.TRADING_TOKENS if t not in selected_tokens]
+            selected_tokens.extend(remaining)
+
+        if selected_tokens:
+            oi_info = ", ".join([f"{t}: ${market_data[t].open_interest:,.0f}" for t in selected_tokens[:3]])
+            logger.info(f"📊 Selected low OI tokens: {oi_info}")
+
+        return selected_tokens if selected_tokens else Config.TRADING_TOKENS
+
+    def calculate_base_amount(self, usdc_amount: float, current_price: float, size_decimals: int) -> int:
+        """
+        Calculate base_amount for order from USDC amount and current price.
+        Formula: base_amount = int((usdc_amount / price) * 10^size_decimals)
+        """
+        if current_price <= 0:
+            raise ValueError(f"Invalid price: {current_price}")
+
+        size_in_base_token = usdc_amount / current_price
+        base_amount = int(size_in_base_token * (10 ** size_decimals))
+
+        return base_amount
+
+    async def get_next_order_index(self, account_num: int) -> int:
+        """Get unique order index for specified account"""
+        async with self._order_index_lock:
+            if account_num == 1:
+                index = self.next_order_index_1
+                self.next_order_index_1 += 1
+            else:
+                index = self.next_order_index_2
+                self.next_order_index_2 += 1
+            return index
+
+    async def get_next_nonce(self, account_num: int) -> int:
+        """Get next nonce for specified account"""
+        async with self._nonce_lock:
+            if account_num == 1:
+                nonce = self.current_nonce_1
+                self.current_nonce_1 += 1
+            else:
+                nonce = self.current_nonce_2
+                self.current_nonce_2 += 1
+            return nonce
 
     async def full_restart(self):
         """Perform full restart: close everything and reinitialize"""
@@ -165,38 +357,29 @@ class TradingEngine:
         # Clear state
         self.active_positions.clear()
         self.positions_by_token.clear()
+        self.market_data_cache.clear()
         self.consecutive_failures = 0
-        self.client = None
+        self.client_1 = None
+        self.client_2 = None
         self.api_client = None
         self.transaction_api = None
+        self.order_api = None
 
         # Reinitialize everything
-        logger.info("Reinitializing Lighter client...")
+        logger.info("Reinitializing Lighter clients...")
         await self.initialize()
 
         logger.info("✅ Full restart completed successfully")
 
-    async def get_next_order_index(self) -> int:
-        """Get unique order index"""
-        async with self._order_index_lock:
-            index = self.next_order_index
-            self.next_order_index += 1
-            return index
-
-    async def get_next_nonce(self) -> int:
-        """Get next nonce"""
-        async with self._nonce_lock:
-            nonce = self.current_nonce
-            self.current_nonce += 1
-            return nonce
-
     async def start(self):
-        """Start trading bot"""
+        """Start hedged trading bot"""
         self.running = True
-        logger.info("🚀 Futures trading bot started")
+        logger.info("🚀 Hedged futures trading bot started")
+        logger.info(f"Strategy: Dual account long/short pairs")
         logger.info(f"Tokens: {Config.TRADING_TOKENS}")
         logger.info(f"Position size: ${Config.MIN_TRADE_AMOUNT} - ${Config.MAX_TRADE_AMOUNT}")
-        logger.info(f"Hold time: {Config.POSITION_HOLD_TIME_MIN}-{Config.POSITION_HOLD_TIME_MAX}s")
+        logger.info(f"Hold time: {Config.POSITION_HOLD_TIME_MIN/3600:.1f}h - {Config.POSITION_HOLD_TIME_MAX/3600:.1f}h")
+        logger.info(f"Low OI filter: {'Enabled' if Config.ENABLE_LOW_OI_FILTER else 'Disabled'}")
 
         await self._trading_loop()
 
@@ -218,7 +401,7 @@ class TradingEngine:
         logger.info(self.stats.get_stats_string())
 
     async def _trading_loop(self):
-        """Main trading loop with automatic recovery on consecutive failures"""
+        """Main trading loop with low OI token selection and hedged pairs"""
         while self.running:
             try:
                 # Check if we need to pause and perform full restart due to consecutive failures
@@ -240,45 +423,140 @@ class TradingEngine:
 
                     continue
 
-                # We can now open positions for any token, even if it has existing positions
-                token = random.choice(Config.TRADING_TOKENS)
+                # Select low OI tokens
+                available_tokens = await self.select_low_oi_tokens()
 
-                # Open a new position
-                await self._open_position(token)
+                if not available_tokens:
+                    logger.warning("No tokens available for trading")
+                    await asyncio.sleep(Config.DELAY_BETWEEN_TRADES)
+                    continue
 
-                # Wait before next trade
+                # Select random token from low OI list
+                token = random.choice(available_tokens)
+
+                # Open hedged position pair (long + short on different accounts)
+                await self._open_hedged_pair(token)
+
+                # Wait before next trade pair
                 await asyncio.sleep(Config.DELAY_BETWEEN_TRADES)
 
             except Exception as e:
                 logger.error(f"Trading loop error: {e}")
                 await asyncio.sleep(5)
 
-    async def _open_position(self, token: str):
-        """Open a long or short position"""
-
-        # Get market index
-        market_index = Config.MARKET_INDICES.get(token)
-        if market_index is None:
-            logger.error(f"Unknown market for token {token}")
+    async def _open_hedged_pair(self, token: str):
+        """
+        Open a hedged pair of positions: long on one account, short on the other.
+        Randomizes which account gets which side, timing, and amounts.
+        """
+        # Get market data with current price
+        market_data = await self.get_market_data(token)
+        if not market_data:
+            logger.error(f"Cannot get market data for {token}")
             return
 
-        # Generate unique position ID
-        position_id = str(uuid.uuid4())[:8]
-
-        # Random position type
-        is_long = random.choice([True, False])
-        position_type = "long" if is_long else "short"
-
-        # Random amount in USDC
-        amount_usdc = round(random.uniform(
+        # Generate base USDC amount
+        base_usdc_amount = round(random.uniform(
             Config.MIN_TRADE_AMOUNT,
             Config.MAX_TRADE_AMOUNT
         ), 2)
 
-        # Calculate base amount
-        base_amount = int(amount_usdc)
+        # Apply variance to create slightly different amounts for each position
+        variance = random.uniform(
+            -Config.TRADE_AMOUNT_VARIANCE_PERCENT / 100,
+            Config.TRADE_AMOUNT_VARIANCE_PERCENT / 100
+        )
+        amount_1 = round(base_usdc_amount * (1 + variance), 2)
+        amount_2 = round(base_usdc_amount * (1 - variance), 2)
 
-        # Calculate price with max slippage
+        # Randomize which account opens long vs short
+        if random.choice([True, False]):
+            # Account 1: Long, Account 2: Short
+            position_1_is_long = True
+            position_2_is_long = False
+        else:
+            # Account 1: Short, Account 2: Long
+            position_1_is_long = False
+            position_2_is_long = True
+
+        logger.info(f"🎯 Opening hedged pair for {token} (OI: ${market_data.open_interest:,.0f}, Price: ${market_data.last_trade_price:.2f})")
+        logger.info(f"   Account 1: {'LONG' if position_1_is_long else 'SHORT'} ${amount_1}")
+        logger.info(f"   Account 2: {'LONG' if position_2_is_long else 'SHORT'} ${amount_2}")
+
+        # Open first position
+        position_id_1 = await self._open_single_position(
+            token=token,
+            is_long=position_1_is_long,
+            amount_usdc=amount_1,
+            account_num=1,
+            market_data=market_data
+        )
+
+        if not position_id_1:
+            return  # Failed to open first position
+
+        # Random delay between the two positions
+        delay = random.uniform(
+            Config.TRADE_TIMING_DELAY_MIN,
+            Config.TRADE_TIMING_DELAY_MAX
+        )
+        await asyncio.sleep(delay)
+
+        # Open second position
+        position_id_2 = await self._open_single_position(
+            token=token,
+            is_long=position_2_is_long,
+            amount_usdc=amount_2,
+            account_num=2,
+            market_data=market_data
+        )
+
+        if not position_id_2:
+            logger.warning(f"Failed to open second position of hedged pair")
+            return
+
+        # Link the paired positions
+        if position_id_1 in self.active_positions and position_id_2 in self.active_positions:
+            self.active_positions[position_id_1].paired_position_id = position_id_2
+            self.active_positions[position_id_2].paired_position_id = position_id_1
+            logger.info(f"✅ Hedged pair opened: {position_id_1} <-> {position_id_2}")
+
+        # Schedule closing for both positions (same hold time for the pair)
+        hold_time = random.uniform(
+            Config.POSITION_HOLD_TIME_MIN,
+            Config.POSITION_HOLD_TIME_MAX
+        )
+        asyncio.create_task(self._schedule_close_position(position_id_1, hold_time))
+        asyncio.create_task(self._schedule_close_position(position_id_2, hold_time))
+
+    async def _open_single_position(
+        self,
+        token: str,
+        is_long: bool,
+        amount_usdc: float,
+        account_num: int,
+        market_data: MarketData
+    ) -> Optional[str]:
+        """
+        Open a single position on specified account with proper price calculation.
+        Returns position_id if successful, None otherwise.
+        """
+        market_index = market_data.market_id
+        position_type = "long" if is_long else "short"
+        position_id = str(uuid.uuid4())[:8]
+
+        # Calculate base_amount using correct formula
+        try:
+            base_amount = self.calculate_base_amount(
+                usdc_amount=amount_usdc,
+                current_price=market_data.last_trade_price,
+                size_decimals=market_data.size_decimals
+            )
+        except Exception as e:
+            logger.error(f"Failed to calculate base_amount: {e}")
+            return None
+
+        # Market order prices
         if is_long:
             price = 999999999  # Buy at any price
             is_ask = False  # Buy to open long
@@ -286,55 +564,37 @@ class TradingEngine:
             price = 1  # Sell at any price
             is_ask = True  # Sell to open short
 
-        try:
-            # Count active positions for this token
-            token_positions = self.positions_by_token.get(token, [])
-            logger.info(f"📈 Opening {position_type.upper()} {token}: ${amount_usdc} "
-                        f"(ID: {position_id}, Active: {len(token_positions)})")
+        # Select the appropriate client
+        client = self.client_1 if account_num == 1 else self.client_2
 
-            # Get order index and nonce
-            order_index = await self.get_next_order_index()
-            nonce = await self.get_next_nonce()
+        try:
+            # Get order index and nonce for this account
+            order_index = await self.get_next_order_index(account_num)
+            nonce = await self.get_next_nonce(account_num)
 
             # Sign order
-            tx_info, error = self.client.sign_create_order(
+            tx_info, error = client.sign_create_order(
                 market_index=market_index,
                 client_order_index=order_index,
                 base_amount=base_amount,
                 price=price,
                 is_ask=is_ask,
-                order_type=self.client.ORDER_TYPE_MARKET,
-                time_in_force=self.client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
-                reduce_only=False,  # False for opening position
+                order_type=client.ORDER_TYPE_MARKET,
+                time_in_force=client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+                reduce_only=False,
                 trigger_price=0,
-                order_expiry=0,  # 0 for IOC
+                order_expiry=0,
                 nonce=nonce
             )
 
             if error:
-                logger.error(f"Failed to sign open order: {error}")
-
-                # Increment consecutive failures counter
+                logger.error(f"Failed to sign order on Account {account_num}: {error}")
                 self.consecutive_failures += 1
-                logger.warning(f"Consecutive failures: {self.consecutive_failures}/{Config.MAX_CONSECUTIVE_FAILURES}")
-
-                # Log failed transaction
-                tx = Transaction(
-                    tx_type="open",
-                    position_type=position_type,
-                    token=token,
-                    amount_usdc=amount_usdc,
-                    base_amount=base_amount,
-                    price=price,
-                    is_success=False,
-                    error=f"Sign error: {error}"
-                )
-                await self.db.log_transaction(tx)
-                return
+                return None
 
             # Send transaction
             result = await self.transaction_api.send_tx(
-                tx_type=self.client.TX_TYPE_CREATE_ORDER,
+                tx_type=client.TX_TYPE_CREATE_ORDER,
                 tx_info=tx_info
             )
 
@@ -345,9 +605,9 @@ class TradingEngine:
                 token=token,
                 amount_usdc=amount_usdc,
                 base_amount=base_amount,
-                price=price,
+                price=market_data.last_trade_price,
                 is_success=True,
-                order_id=str(order_index),
+                order_id=f"Acc{account_num}_{order_index}",
                 tx_hash=str(result) if result else None
             )
             open_tx_id = await self.db.log_transaction(tx)
@@ -361,7 +621,9 @@ class TradingEngine:
                 base_amount=base_amount,
                 amount_usdc=amount_usdc,
                 open_order_index=order_index,
-                open_tx_id=open_tx_id
+                open_tx_id=open_tx_id,
+                account_num=account_num,
+                entry_price=market_data.last_trade_price
             )
 
             # Store position
@@ -372,25 +634,17 @@ class TradingEngine:
                 self.positions_by_token[token] = []
             self.positions_by_token[token].append(position_id)
 
-            logger.info(f"✅ Opened {position_type} {token} (ID: {position_id})")
+            logger.info(f"✅ Opened {position_type.upper()} {token} on Account {account_num} (ID: {position_id}, Price: ${market_data.last_trade_price:.2f})")
             self.stats.add_position(True, amount_usdc, is_long)
 
             # Reset consecutive failures on success
             self.consecutive_failures = 0
 
-            # Schedule position close
-            hold_time = random.uniform(
-                Config.POSITION_HOLD_TIME_MIN,
-                Config.POSITION_HOLD_TIME_MAX
-            )
-            asyncio.create_task(self._schedule_close_position(position_id, hold_time))
+            return position_id
 
         except Exception as e:
-            logger.error(f"Failed to open position for {token}: {e}")
-
-            # Increment consecutive failures counter
+            logger.error(f"Failed to open position on Account {account_num} for {token}: {e}")
             self.consecutive_failures += 1
-            logger.warning(f"Consecutive failures: {self.consecutive_failures}/{Config.MAX_CONSECUTIVE_FAILURES}")
 
             # Log failed transaction
             tx = Transaction(
@@ -399,11 +653,13 @@ class TradingEngine:
                 token=token,
                 amount_usdc=amount_usdc,
                 base_amount=base_amount,
-                price=price,
+                price=market_data.last_trade_price,
                 is_success=False,
                 error=str(e)
             )
             await self.db.log_transaction(tx)
+
+            return None
 
     async def _schedule_close_position(self, position_id: str, hold_time: float):
         """Schedule closing a specific position after hold time"""
@@ -411,7 +667,7 @@ class TradingEngine:
         await self._close_position(position_id)
 
     async def _close_position(self, position_id: str):
-        """Close a specific position by ID"""
+        """Close a specific position by ID (supports dual accounts)"""
 
         position = self.active_positions.get(position_id)
         if not position or position.is_closing:
@@ -433,23 +689,26 @@ class TradingEngine:
             price = 999999999  # Buy at any price
             is_ask = False
 
+        # Select the appropriate client
+        client = self.client_1 if position.account_num == 1 else self.client_2
+
         try:
-            logger.info(f"📉 Closing {position.position_type.upper()} {position.token} "
+            logger.info(f"📉 Closing {position.position_type.upper()} {position.token} on Account {position.account_num} "
                         f"(ID: {position_id})")
 
-            # Get order index and nonce
-            order_index = await self.get_next_order_index()
-            nonce = await self.get_next_nonce()
+            # Get order index and nonce for this account
+            order_index = await self.get_next_order_index(position.account_num)
+            nonce = await self.get_next_nonce(position.account_num)
 
             # Sign order
-            tx_info, error = self.client.sign_create_order(
+            tx_info, error = client.sign_create_order(
                 market_index=market_index,
                 client_order_index=order_index,
                 base_amount=position.base_amount,
                 price=price,
                 is_ask=is_ask,
-                order_type=self.client.ORDER_TYPE_MARKET,
-                time_in_force=self.client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+                order_type=client.ORDER_TYPE_MARKET,
+                time_in_force=client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
                 reduce_only=True,  # True for closing position
                 trigger_price=0,
                 order_expiry=0,  # 0 for IOC
@@ -463,7 +722,7 @@ class TradingEngine:
 
             # Send transaction
             result = await self.transaction_api.send_tx(
-                tx_type=self.client.TX_TYPE_CREATE_ORDER,
+                tx_type=client.TX_TYPE_CREATE_ORDER,
                 tx_info=tx_info
             )
 
@@ -474,10 +733,10 @@ class TradingEngine:
                 token=position.token,
                 amount_usdc=position.amount_usdc,
                 base_amount=position.base_amount,
-                price=price,
+                price=position.entry_price,
                 is_success=True,
                 dependency=position.open_tx_id,
-                order_id=str(order_index),
+                order_id=f"Acc{position.account_num}_{order_index}",
                 tx_hash=str(result) if result else None
             )
             await self.db.log_transaction(tx)
@@ -494,7 +753,7 @@ class TradingEngine:
             # Count remaining positions for this token
             remaining = len(self.positions_by_token.get(position.token, []))
 
-            logger.info(f"✅ Closed {position.position_type} {position.token} "
+            logger.info(f"✅ Closed {position.position_type} {position.token} on Account {position.account_num} "
                         f"(ID: {position_id}, Remaining: {remaining})")
             logger.info(self.stats.get_stats_string())
 
@@ -509,7 +768,7 @@ class TradingEngine:
                 token=position.token,
                 amount_usdc=position.amount_usdc,
                 base_amount=position.base_amount,
-                price=price,
+                price=position.entry_price,
                 is_success=False,
                 dependency=position.open_tx_id,
                 error=str(e)

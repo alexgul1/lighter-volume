@@ -6,14 +6,25 @@ load_dotenv()
 
 
 class Config:
-    """Application configuration for futures trading"""
+    """Application configuration for hedged futures trading with dual accounts"""
 
     # Lighter API
     BASE_URL = os.getenv("LIGHTER_BASE_URL", "https://mainnet.zklighter.elliot.ai")
-    API_KEY_PRIVATE_KEY = os.getenv("LIGHTER_API_KEY_PRIVATE_KEY")
-    ETH_PRIVATE_KEY = os.getenv("LIGHTER_ETH_PRIVATE_KEY")
-    ACCOUNT_INDEX = int(os.getenv("LIGHTER_ACCOUNT_INDEX", "1"))
-    API_KEY_INDEX = int(os.getenv("LIGHTER_API_KEY_INDEX", "2"))
+
+    # Account 1 (Primary)
+    ACCOUNT_1_PRIVATE_KEY = os.getenv("LIGHTER_ACCOUNT_1_PRIVATE_KEY")
+    ACCOUNT_1_INDEX = int(os.getenv("LIGHTER_ACCOUNT_1_INDEX", "1"))
+    ACCOUNT_1_API_KEY_INDEX = int(os.getenv("LIGHTER_ACCOUNT_1_API_KEY_INDEX", "2"))
+
+    # Account 2 (Secondary)
+    ACCOUNT_2_PRIVATE_KEY = os.getenv("LIGHTER_ACCOUNT_2_PRIVATE_KEY")
+    ACCOUNT_2_INDEX = int(os.getenv("LIGHTER_ACCOUNT_2_INDEX", "1"))
+    ACCOUNT_2_API_KEY_INDEX = int(os.getenv("LIGHTER_ACCOUNT_2_API_KEY_INDEX", "2"))
+
+    # Legacy support (fallback to single account if dual not configured)
+    LEGACY_API_KEY_PRIVATE_KEY = os.getenv("LIGHTER_API_KEY_PRIVATE_KEY")
+    LEGACY_ACCOUNT_INDEX = int(os.getenv("LIGHTER_ACCOUNT_INDEX", "1"))
+    LEGACY_API_KEY_INDEX = int(os.getenv("LIGHTER_API_KEY_INDEX", "2"))
 
     # Account Type
     ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "standard").lower()
@@ -32,20 +43,33 @@ class Config:
     MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "lighter_bot")
     MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "transactions")
 
-    # Trading
+    # Trading Strategy
     MIN_TRADE_AMOUNT = float(os.getenv("MIN_TRADE_AMOUNT_USDC", "10.0"))
     MAX_TRADE_AMOUNT = float(os.getenv("MAX_TRADE_AMOUNT_USDC", "50.0"))
     TRADING_TOKENS: List[str] = os.getenv("TRADING_TOKENS", "ETH,BTC,SOL").split(",")
     DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "3"))
 
-    # Position timing
-    POSITION_HOLD_TIME_MIN = float(os.getenv("POSITION_HOLD_TIME_MIN", "2"))
-    POSITION_HOLD_TIME_MAX = float(os.getenv("POSITION_HOLD_TIME_MAX", "5"))
-    DELAY_BETWEEN_TRADES = float(os.getenv("DELAY_BETWEEN_TRADES", "3"))
+    # Hedging Configuration
+    # Randomization between dual account trades to avoid exact matching
+    TRADE_AMOUNT_VARIANCE_PERCENT = float(os.getenv("TRADE_AMOUNT_VARIANCE_PERCENT", "2.0"))  # 1-3% variance
+    TRADE_TIMING_DELAY_MIN = float(os.getenv("TRADE_TIMING_DELAY_MIN", "1.0"))  # Min seconds between paired trades
+    TRADE_TIMING_DELAY_MAX = float(os.getenv("TRADE_TIMING_DELAY_MAX", "5.0"))  # Max seconds between paired trades
+
+    # Position Timing (in seconds)
+    # Default: 1-3 hours = 3600-10800 seconds
+    POSITION_HOLD_TIME_MIN = float(os.getenv("POSITION_HOLD_TIME_MIN", "3600"))  # 1 hour
+    POSITION_HOLD_TIME_MAX = float(os.getenv("POSITION_HOLD_TIME_MAX", "10800"))  # 3 hours
+    DELAY_BETWEEN_TRADES = float(os.getenv("DELAY_BETWEEN_TRADES", "10"))
 
     # Error handling and recovery
     MAX_CONSECUTIVE_FAILURES = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "7"))  # 5-10 range, default 7
     PAUSE_DURATION_SECONDS = int(os.getenv("PAUSE_DURATION_SECONDS", "60"))  # 1 minute pause
+
+    # Low OI Token Selection
+    # Enable filtering for low open interest tokens (better rewards)
+    ENABLE_LOW_OI_FILTER = os.getenv("ENABLE_LOW_OI_FILTER", "true").lower() == "true"
+    MAX_OPEN_INTEREST_THRESHOLD = float(os.getenv("MAX_OPEN_INTEREST_THRESHOLD", "1000000"))  # Max OI in USDC
+    MIN_MARKETS_FOR_OI_FILTER = int(os.getenv("MIN_MARKETS_FOR_OI_FILTER", "2"))  # Require at least N markets
 
     # Logging
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -60,20 +84,38 @@ class Config:
         "LINK": 5,
         "UNI": 6,
         "AAVE": 7,
-        "HYPE": 24  # Added from your example
+        "HYPE": 24
     }
-
-    # Price scaling (Lighter uses integer prices with 2 decimal places)
-    PRICE_SCALE = 100  # For price conversion
-    BASE_AMOUNT_SCALE = 1  # BaseAmount seems to be in smallest units
 
     @classmethod
     def validate(cls):
-        """Validate configuration"""
-        if not cls.API_KEY_PRIVATE_KEY:
-            raise ValueError("LIGHTER_API_KEY_PRIVATE_KEY is required")
-        if not cls.ETH_PRIVATE_KEY:
-            raise ValueError("LIGHTER_ETH_PRIVATE_KEY is required")
+        """Validate configuration for dual account setup"""
+        # Check if dual account mode or legacy mode
+        has_dual_accounts = cls.ACCOUNT_1_PRIVATE_KEY and cls.ACCOUNT_2_PRIVATE_KEY
+        has_legacy = cls.LEGACY_API_KEY_PRIVATE_KEY
+
+        if not has_dual_accounts and not has_legacy:
+            raise ValueError(
+                "Either dual accounts (LIGHTER_ACCOUNT_1_PRIVATE_KEY + LIGHTER_ACCOUNT_2_PRIVATE_KEY) "
+                "or legacy single account (LIGHTER_API_KEY_PRIVATE_KEY) is required"
+            )
+
+        if has_dual_accounts:
+            if not cls.ACCOUNT_1_PRIVATE_KEY:
+                raise ValueError("LIGHTER_ACCOUNT_1_PRIVATE_KEY is required for dual account mode")
+            if not cls.ACCOUNT_2_PRIVATE_KEY:
+                raise ValueError("LIGHTER_ACCOUNT_2_PRIVATE_KEY is required for dual account mode")
+
+        # Validate trading tokens
         for token in cls.TRADING_TOKENS:
             if token not in cls.MARKET_INDICES:
                 raise ValueError(f"Unknown token: {token}")
+
+        # Validate variance is reasonable
+        if cls.TRADE_AMOUNT_VARIANCE_PERCENT > 10:
+            raise ValueError("TRADE_AMOUNT_VARIANCE_PERCENT should not exceed 10%")
+
+    @classmethod
+    def is_dual_account_mode(cls) -> bool:
+        """Check if running in dual account (hedged) mode"""
+        return bool(cls.ACCOUNT_1_PRIVATE_KEY and cls.ACCOUNT_2_PRIVATE_KEY)
