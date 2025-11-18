@@ -15,6 +15,9 @@ Automated hedged futures trading bot for Lighter Protocol. Uses dual accounts to
 - **Leverage Control**: Sets configurable leverage (default 3x) on both accounts
 - **MongoDB Logging**: Complete audit trail of all positions
 - **Automatic Recovery**: Pauses and restarts on consecutive failures
+- **Telegram Notifications**: Real-time alerts for trades, positions, P/L, and errors
+- **Real-Time Position Monitoring**: Tracks P/L via REST polling (1-2 second intervals)
+- **Hedged Pair P/L Tracking**: Calculates combined profit/loss for paired positions
 
 ## How It Works
 
@@ -65,3 +68,83 @@ DEFAULT_LEVERAGE=3
 POSITION_HOLD_TIME_MIN=3600   # 1 hour
 POSITION_HOLD_TIME_MAX=10800  # 3 hours
 DELAY_BETWEEN_TRADES=10
+
+# Telegram Notifications (optional)
+TELEGRAM_BOT_TOKEN=your_bot_token_from_@BotFather
+TELEGRAM_CHAT_ID=your_chat_id_or_group_id
+TELEGRAM_TOPIC_ID=  # Optional: for groups with topics
+TELEGRAM_ENABLE_NOTIFICATIONS=true
+
+# Position Monitoring
+ENABLE_POSITION_MONITORING=true
+POSITION_MONITOR_INTERVAL=2.0  # seconds
+```
+
+## Telegram Setup
+
+The bot can send real-time notifications to Telegram about trading activity:
+
+1. **Create a Bot:**
+   - Message [@BotFather](https://t.me/BotFather) on Telegram
+   - Send `/newbot` and follow instructions
+   - Copy the bot token
+
+2. **Get Chat ID:**
+   - For private messages: Send a message to your bot, then visit:
+     `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates`
+   - For groups: Add bot to group, send a message, use same URL
+   - Look for `"chat":{"id":...}` in the response
+
+3. **Optional - Topic ID:**
+   - For groups with topics/forums enabled
+   - Right-click on topic → Copy link → Extract topic ID from URL
+   - Format: `-1001234567890/12345` (the `12345` is the topic ID)
+
+4. **Configure:**
+   - Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to `.env`
+   - Optionally add `TELEGRAM_TOPIC_ID` for topic-specific messages
+
+### Notification Types
+
+The bot sends notifications for:
+- **Position Opened**: Token, type (long/short), size, price, OI
+- **Hedged Pair Opened**: Both positions with full details
+- **Position Closed**: P/L, hold time, price change
+- **Hedged Pair Closed**: Combined P/L for both positions
+- **Errors**: Trading errors, API failures
+- **Restart Events**: Bot restarts and recovery
+- **Summary**: Periodic trading statistics
+
+### Example Notification
+
+```
+🎯 Hedged Pair Opened
+
+Token: SOL
+Price: $98.45
+Open Interest: $234,567
+Total Size: $50.00
+
+📈 Position 1 (LONG):
+  Account: 1
+  Size: $25.50
+  ID: a1b2c3d4
+
+📉 Position 2 (SHORT):
+  Account: 2
+  Size: $24.50
+  ID: e5f6g7h8
+
+⏰ 2025-11-18 20:30:45 UTC
+```
+
+## Position Monitoring
+
+The bot continuously monitors open positions via REST API polling (every 2 seconds by default):
+
+- **Real-time P/L**: Tracks unrealized profit/loss
+- **Liquidation Risk**: Warns when price approaches liquidation
+- **Price Updates**: Fetches latest market prices
+- **Hedged Pair Tracking**: Calculates combined P/L for paired positions
+
+Since Lighter Protocol doesn't support WebSockets, the bot uses aggressive REST polling to achieve near-real-time monitoring.
