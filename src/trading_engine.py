@@ -588,15 +588,25 @@ class TradingEngine:
                     close_tasks.append(self._close_position(position_id))
 
             if close_tasks:
-                logger.info(f"⏳ Waiting for {len(close_tasks)} positions to close...")
-                results = await asyncio.gather(*close_tasks, return_exceptions=True)
+                logger.info(f"⏳ Waiting for {len(close_tasks)} positions to close (timeout: 120s)...")
+                try:
+                    # Give enough time for worker processes to complete (60s each + buffer)
+                    results = await asyncio.wait_for(
+                        asyncio.gather(*close_tasks, return_exceptions=True),
+                        timeout=120
+                    )
 
-                # Log any errors
-                for i, result in enumerate(results):
-                    if isinstance(result, Exception):
-                        logger.error(f"Error closing position: {result}")
+                    # Log any errors
+                    for i, result in enumerate(results):
+                        if isinstance(result, Exception):
+                            logger.error(f"Error closing position: {result}")
 
-                logger.info("✅ All positions closed")
+                    logger.info("✅ All positions closed successfully")
+                except asyncio.TimeoutError:
+                    logger.error("❌ Timeout waiting for positions to close")
+                    logger.warning(f"⚠️ {len([p for p in self.active_positions.values() if not p.is_closing])} positions may still be open")
+        else:
+            logger.info("No open positions to close")
 
         logger.info("Trading bot stopped")
         logger.info(self.stats.get_stats_string())

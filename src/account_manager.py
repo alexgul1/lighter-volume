@@ -7,6 +7,7 @@ global singleton conflicts in lighter-sdk 0.1.4+
 
 import asyncio
 import logging
+import queue
 from typing import Dict, Any, Optional
 from multiprocessing import Process, Queue
 from src.account_worker import worker_main
@@ -59,30 +60,38 @@ class AccountManager:
             logger.info(f"🚀 Starting worker process for Account {account_num}, command: {command}")
             worker_process.start()
 
-            # Wait for result with timeout
+            # Wait for result with longer timeout (especially for close operations during shutdown)
             # Run in executor to avoid blocking async event loop
             loop = asyncio.get_event_loop()
+            timeout = 60 if command == 'close_position' else 30
             result = await loop.run_in_executor(
                 None,
-                lambda: result_queue.get(timeout=30)
+                lambda: result_queue.get(timeout=timeout)
             )
 
-            # Wait for process to finish
-            worker_process.join(timeout=5)
+            # Wait for process to finish naturally
+            worker_process.join(timeout=10)
 
             if worker_process.is_alive():
-                logger.warning(f"⚠️ Worker process for Account {account_num} still alive, terminating")
+                logger.warning(f"⚠️ Worker process for Account {account_num} still alive after {timeout}s, terminating")
                 worker_process.terminate()
-                worker_process.join(timeout=2)
+                worker_process.join(timeout=5)
 
             logger.info(f"✅ Worker process for Account {account_num} completed: {result}")
             return result
 
+        except queue.Empty:
+            logger.error(f"❌ Worker process for Account {account_num} timed out after {timeout}s")
+            if worker_process.is_alive():
+                logger.warning(f"⚠️ Terminating stuck worker process")
+                worker_process.terminate()
+                worker_process.join(timeout=5)
+            return {'error': f'Worker timeout after {timeout}s'}
         except Exception as e:
             logger.error(f"❌ Worker process error for Account {account_num}: {e}")
             if worker_process.is_alive():
                 worker_process.terminate()
-                worker_process.join(timeout=2)
+                worker_process.join(timeout=5)
             return {'error': str(e)}
 
     async def set_leverage(self, account_num: int, token: str, market_index: int, leverage: int) -> bool:
