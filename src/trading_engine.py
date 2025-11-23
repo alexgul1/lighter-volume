@@ -286,12 +286,13 @@ class TradingEngine:
         imf: int
     ):
         """Set leverage for a single market with retry logic for transient errors"""
-        max_retries = 3
+        max_retries = 5  # Increased to allow for nonce skipping
 
         for attempt in range(max_retries):
             try:
-                # Fetch fresh nonce for this attempt
-                nonce = await self.get_next_nonce(account_num=account_num)
+                # On attempts after the first, try skipping potentially invalid nonce
+                skip_invalid = (attempt > 0)
+                nonce = await self.get_next_nonce(account_num=account_num, skip_invalid=skip_invalid)
                 logger.info(f"📝 Signing leverage update for {token} on Account {account_num} with nonce={nonce}")
 
                 # Sign leverage update
@@ -321,7 +322,9 @@ class TradingEngine:
                 error_str = str(e).lower()
                 if attempt < max_retries - 1:
                     logger.warning(f"⚠️ Error setting leverage for {token} on Account {account_num} (attempt {attempt + 1}/{max_retries}): {e}")
-                    await asyncio.sleep(1.0)  # Wait before retry
+                    # Only delay if it's not a nonce error (nonce errors need immediate retry with new nonce)
+                    if "nonce" not in error_str:
+                        await asyncio.sleep(1.0)
                     continue
                 else:
                     # Final attempt failed
@@ -664,10 +667,14 @@ class TradingEngine:
                 self.next_order_index_2 += 1
             return index
 
-    async def get_next_nonce(self, account_num: int) -> int:
+    async def get_next_nonce(self, account_num: int, skip_invalid: bool = False) -> int:
         """
         Get next nonce for specified account by fetching fresh from API.
         Uses separate transaction_api for each account to avoid shared state conflicts.
+
+        Args:
+            account_num: Account number (1 or 2)
+            skip_invalid: If True, increment nonce by 1 to skip potentially invalid nonce
         """
         async with self._nonce_lock:
             try:
@@ -678,6 +685,14 @@ class TradingEngine:
                         api_key_index=Config.ACCOUNT_1_API_KEY_INDEX
                     )
                     nonce = next_nonce.nonce
+
+                    # If skip_invalid, try nonce+1 to bypass potentially stuck/invalid nonce
+                    if skip_invalid:
+                        nonce += 1
+                        logger.warning(f"⚠️ Skipping potentially invalid nonce, using {nonce} instead")
+                        # Update cached nonce to stay in sync
+                        self.current_nonce_1 = nonce + 1
+
                     logger.info(f"✅ Received nonce for Account 1: {nonce}")
                 else:
                     logger.info(f"🔍 Fetching fresh nonce for Account 2 (index={Config.ACCOUNT_2_INDEX}, api_key_index={Config.ACCOUNT_2_API_KEY_INDEX})")
@@ -686,6 +701,12 @@ class TradingEngine:
                         api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
                     )
                     nonce = next_nonce.nonce
+
+                    if skip_invalid:
+                        nonce += 1
+                        logger.warning(f"⚠️ Skipping potentially invalid nonce, using {nonce} instead")
+                        self.current_nonce_2 = nonce + 1
+
                     logger.info(f"✅ Received nonce for Account 2: {nonce}")
                 return nonce
             except Exception as e:
@@ -952,12 +973,14 @@ class TradingEngine:
         client = self.client_1 if account_num == 1 else self.client_2
 
         # Retry logic for transient errors
-        max_retries = 3
+        max_retries = 5  # Increased to allow for nonce skipping
         for attempt in range(max_retries):
             try:
                 # Get order index and fresh nonce for this account
+                # On attempts after the first, try skipping potentially invalid nonce
                 order_index = await self.get_next_order_index(account_num)
-                nonce = await self.get_next_nonce(account_num)
+                skip_invalid = (attempt > 0)
+                nonce = await self.get_next_nonce(account_num, skip_invalid=skip_invalid)
 
                 # Sign order
                 tx_info, error = client.sign_create_order(
@@ -989,9 +1012,12 @@ class TradingEngine:
                 break
 
             except Exception as e:
+                error_str = str(e).lower()
                 if attempt < max_retries - 1:
                     logger.warning(f"Error opening position on Account {account_num} (attempt {attempt + 1}/{max_retries}): {e}")
-                    await asyncio.sleep(1.0)  # Wait before retry
+                    # Only delay if it's not a nonce error (nonce errors need immediate retry with new nonce)
+                    if "nonce" not in error_str:
+                        await asyncio.sleep(1.0)
                     continue
                 # Re-raise on final attempt
                 raise
@@ -1096,12 +1122,14 @@ class TradingEngine:
                     f"(ID: {position_id})")
 
         # Retry logic for transient errors
-        max_retries = 3
+        max_retries = 5  # Increased to allow for nonce skipping
         for attempt in range(max_retries):
             try:
                 # Get order index and fresh nonce for this account
+                # On attempts after the first, try skipping potentially invalid nonce
                 order_index = await self.get_next_order_index(position.account_num)
-                nonce = await self.get_next_nonce(position.account_num)
+                skip_invalid = (attempt > 0)
+                nonce = await self.get_next_nonce(position.account_num, skip_invalid=skip_invalid)
 
                 # Sign order
                 tx_info, error = client.sign_create_order(
@@ -1133,9 +1161,12 @@ class TradingEngine:
                 break
 
             except Exception as e:
+                error_str = str(e).lower()
                 if attempt < max_retries - 1:
                     logger.warning(f"Error closing position on Account {position.account_num} (attempt {attempt + 1}/{max_retries}): {e}")
-                    await asyncio.sleep(1.0)  # Wait before retry
+                    # Only delay if it's not a nonce error (nonce errors need immediate retry with new nonce)
+                    if "nonce" not in error_str:
+                        await asyncio.sleep(1.0)
                     continue
                 # Re-raise on final attempt
                 raise
