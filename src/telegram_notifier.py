@@ -246,18 +246,22 @@ class TelegramNotifier:
         token: str,
         position_1_id: str,
         position_1_type: str,
-        position_1_amount: float,
+        position_1_margin: float,
+        position_1_size: float,
         position_1_account: int,
         position_2_id: str,
         position_2_type: str,
-        position_2_amount: float,
+        position_2_margin: float,
+        position_2_size: float,
         position_2_account: int,
         entry_price: float,
         open_interest: float,
-        hold_time_seconds: float
+        hold_time_seconds: float,
+        leverage: int
     ):
         """Notify when a hedged pair is opened"""
-        total_size = position_1_amount + position_2_amount
+        total_margin = position_1_margin + position_2_margin
+        total_size = position_1_size + position_2_size
 
         # Convert hold time to human readable format
         hold_time_minutes = hold_time_seconds / 60
@@ -273,17 +277,21 @@ class TelegramNotifier:
             f"<b>Token:</b> {token}\n"
             f"<b>Price:</b> ${entry_price:.4f}\n"
             f"<b>Open Interest:</b> ${open_interest:,.0f}\n"
-            f"<b>Total Size:</b> ${total_size:.2f}\n"
+            f"<b>Leverage:</b> {leverage}x\n"
+            f"<b>Total Margin:</b> ${total_margin:.2f}\n"
+            f"<b>Total Position Size:</b> ${total_size:.2f}\n"
             f"<b>Will close in:</b> {hold_time_str}\n\n"
 
             f"📈 <b>Position 1 ({position_1_type.upper()}):</b>\n"
             f"  Account: {position_1_account}\n"
-            f"  Size: ${position_1_amount:.2f}\n"
+            f"  Margin: ${position_1_margin:.2f}\n"
+            f"  Position Size: ${position_1_size:.2f}\n"
             f"  ID: <code>{position_1_id}</code>\n\n"
 
             f"📉 <b>Position 2 ({position_2_type.upper()}):</b>\n"
             f"  Account: {position_2_account}\n"
-            f"  Size: ${position_2_amount:.2f}\n"
+            f"  Margin: ${position_2_margin:.2f}\n"
+            f"  Position Size: ${position_2_size:.2f}\n"
             f"  ID: <code>{position_2_id}</code>\n\n"
 
             f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}"

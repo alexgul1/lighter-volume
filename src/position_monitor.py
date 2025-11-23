@@ -97,10 +97,19 @@ class PositionMonitor:
             # Get account data
             response = await self.account_api.account(by="index", value=str(account_index))
 
-            if not response.data:
-                return
+            # Handle different response formats from lighter SDK
+            account_data = None
+            if hasattr(response, 'data') and response.data:
+                account_data = response.data[0]
+            elif hasattr(response, 'sub_accounts') and response.sub_accounts:
+                account_data = response.sub_accounts[0]
+            elif hasattr(response, '__getitem__'):
+                account_data = response[0]
+            else:
+                account_data = response
 
-            account_data = response.data[0]
+            if not account_data or not hasattr(account_data, 'positions'):
+                return
 
             # Process each position
             for position in account_data.positions:

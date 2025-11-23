@@ -238,20 +238,32 @@ class TradingEngine:
             account_index = Config.ACCOUNT_1_INDEX if account_num == 1 else Config.ACCOUNT_2_INDEX
             response = await self.account_api.account(by="index", value=str(account_index))
 
-            if not response.data:
+            # Handle different response formats from lighter SDK
+            account_data = None
+            if hasattr(response, 'data') and response.data:
+                account_data = response.data[0]
+            elif hasattr(response, 'sub_accounts') and response.sub_accounts:
+                account_data = response.sub_accounts[0]
+            elif hasattr(response, '__getitem__'):
+                # Response is directly indexable
+                account_data = response[0]
+            else:
+                # Response itself is the account data
+                account_data = response
+
+            if not account_data:
                 return (0.0, 0.0)
 
-            account_data = response.data[0]
-
             # Get available balance (USDC)
-            available_balance = float(account_data.available_balance) if account_data.available_balance else 0.0
+            available_balance = float(account_data.available_balance) if hasattr(account_data, 'available_balance') and account_data.available_balance else 0.0
 
             # Calculate total PnL (unrealized + realized)
             total_pnl = 0.0
-            for position in account_data.positions:
-                unrealized_pnl = float(position.unrealized_pnl) if position.unrealized_pnl else 0.0
-                realized_pnl = float(position.realized_pnl) if position.realized_pnl else 0.0
-                total_pnl += unrealized_pnl + realized_pnl
+            if hasattr(account_data, 'positions'):
+                for position in account_data.positions:
+                    unrealized_pnl = float(position.unrealized_pnl) if position.unrealized_pnl else 0.0
+                    realized_pnl = float(position.realized_pnl) if position.realized_pnl else 0.0
+                    total_pnl += unrealized_pnl + realized_pnl
 
             return (available_balance, total_pnl)
 
@@ -265,10 +277,20 @@ class TradingEngine:
             account_index = Config.ACCOUNT_1_INDEX if account_num == 1 else Config.ACCOUNT_2_INDEX
             response = await self.account_api.account(by="index", value=str(account_index))
 
-            if not response.data:
+            # Handle different response formats from lighter SDK
+            account_data = None
+            if hasattr(response, 'data') and response.data:
+                account_data = response.data[0]
+            elif hasattr(response, 'sub_accounts') and response.sub_accounts:
+                account_data = response.sub_accounts[0]
+            elif hasattr(response, '__getitem__'):
+                account_data = response[0]
+            else:
+                account_data = response
+
+            if not account_data or not hasattr(account_data, 'positions'):
                 return 0
 
-            account_data = response.data[0]
             count = sum(1 for pos in account_data.positions if float(pos.position) != 0)
             return count
 
@@ -435,11 +457,17 @@ class TradingEngine:
 
             detail = details_response.order_book_details[0]
 
+            # Convert open interest to USDC value
+            # OI comes in base units of the token, need to convert to USDC
+            # OI in USDC = (oi_base_units / 10^size_decimals) * price
+            oi_in_tokens = detail.open_interest / (10 ** detail.size_decimals)
+            oi_in_usdc = oi_in_tokens * detail.last_trade_price
+
             market_data = MarketData(
                 symbol=detail.symbol,
                 market_id=detail.market_id,
                 last_trade_price=detail.last_trade_price,
-                open_interest=detail.open_interest,
+                open_interest=oi_in_usdc,
                 size_decimals=detail.size_decimals,
                 price_decimals=detail.price_decimals
             )
@@ -539,7 +567,9 @@ class TradingEngine:
         logger.info("🚀 Hedged futures trading bot started")
         logger.info(f"Strategy: Dual account long/short pairs")
         logger.info(f"Tokens: {Config.TRADING_TOKENS}")
-        logger.info(f"Position size: ${Config.MIN_TRADE_AMOUNT} - ${Config.MAX_TRADE_AMOUNT}")
+        logger.info(f"Leverage: {Config.DEFAULT_LEVERAGE}x")
+        logger.info(f"Margin per position: ${Config.MIN_TRADE_AMOUNT} - ${Config.MAX_TRADE_AMOUNT}")
+        logger.info(f"Position size: ${Config.MIN_TRADE_AMOUNT * Config.DEFAULT_LEVERAGE} - ${Config.MAX_TRADE_AMOUNT * Config.DEFAULT_LEVERAGE}")
         logger.info(f"Hold time: {Config.POSITION_HOLD_TIME_MIN/3600:.1f}h - {Config.POSITION_HOLD_TIME_MAX/3600:.1f}h")
         logger.info(f"Low OI filter: {'Enabled' if Config.ENABLE_LOW_OI_FILTER else 'Disabled'}")
 
@@ -628,19 +658,24 @@ class TradingEngine:
             logger.error(f"Cannot get market data for {token}")
             return
 
-        # Generate base USDC amount
-        base_usdc_amount = round(random.uniform(
+        # Generate base margin (not position size!)
+        # MIN_TRADE_AMOUNT and MAX_TRADE_AMOUNT now represent MARGIN
+        base_margin = round(random.uniform(
             Config.MIN_TRADE_AMOUNT,
             Config.MAX_TRADE_AMOUNT
         ), 2)
 
-        # Apply variance to create slightly different amounts for each position
+        # Apply variance to create slightly different margins for each position
         variance = random.uniform(
             -Config.TRADE_AMOUNT_VARIANCE_PERCENT / 100,
             Config.TRADE_AMOUNT_VARIANCE_PERCENT / 100
         )
-        amount_1 = round(base_usdc_amount * (1 + variance), 2)
-        amount_2 = round(base_usdc_amount * (1 - variance), 2)
+        margin_1 = round(base_margin * (1 + variance), 2)
+        margin_2 = round(base_margin * (1 - variance), 2)
+
+        # Calculate position sizes: Position Size = Margin × Leverage
+        position_size_1 = round(margin_1 * Config.DEFAULT_LEVERAGE, 2)
+        position_size_2 = round(margin_2 * Config.DEFAULT_LEVERAGE, 2)
 
         # Randomize which account opens long vs short
         if random.choice([True, False]):
@@ -653,14 +688,14 @@ class TradingEngine:
             position_2_is_long = True
 
         logger.info(f"🎯 Opening hedged pair for {token} (OI: ${market_data.open_interest:,.0f}, Price: ${market_data.last_trade_price:.2f})")
-        logger.info(f"   Account 1: {'LONG' if position_1_is_long else 'SHORT'} ${amount_1}")
-        logger.info(f"   Account 2: {'LONG' if position_2_is_long else 'SHORT'} ${amount_2}")
+        logger.info(f"   Account 1: {'LONG' if position_1_is_long else 'SHORT'} - Margin: ${margin_1}, Position: ${position_size_1}")
+        logger.info(f"   Account 2: {'LONG' if position_2_is_long else 'SHORT'} - Margin: ${margin_2}, Position: ${position_size_2}")
 
-        # Open first position
+        # Open first position (using position size, not margin)
         position_id_1 = await self._open_single_position(
             token=token,
             is_long=position_1_is_long,
-            amount_usdc=amount_1,
+            amount_usdc=position_size_1,
             account_num=1,
             market_data=market_data
         )
@@ -675,11 +710,11 @@ class TradingEngine:
         )
         await asyncio.sleep(delay)
 
-        # Open second position
+        # Open second position (using position size, not margin)
         position_id_2 = await self._open_single_position(
             token=token,
             is_long=position_2_is_long,
-            amount_usdc=amount_2,
+            amount_usdc=position_size_2,
             account_num=2,
             market_data=market_data
         )
@@ -706,15 +741,18 @@ class TradingEngine:
                     token=token,
                     position_1_id=position_id_1,
                     position_1_type="long" if position_1_is_long else "short",
-                    position_1_amount=amount_1,
+                    position_1_margin=margin_1,
+                    position_1_size=position_size_1,
                     position_1_account=1,
                     position_2_id=position_id_2,
                     position_2_type="long" if position_2_is_long else "short",
-                    position_2_amount=amount_2,
+                    position_2_margin=margin_2,
+                    position_2_size=position_size_2,
                     position_2_account=2,
                     entry_price=market_data.last_trade_price,
                     open_interest=market_data.open_interest,
-                    hold_time_seconds=hold_time
+                    hold_time_seconds=hold_time,
+                    leverage=Config.DEFAULT_LEVERAGE
                 )
 
         asyncio.create_task(self._schedule_close_position(position_id_1, hold_time))
