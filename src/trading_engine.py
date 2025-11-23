@@ -236,39 +236,64 @@ class TradingEngine:
         """
         try:
             account_index = Config.ACCOUNT_1_INDEX if account_num == 1 else Config.ACCOUNT_2_INDEX
+            logger.debug(f"Fetching balance for Account {account_num} (index={account_index})")
+
             response = await self.account_api.account(by="index", value=str(account_index))
+
+            # Debug: Log response type and attributes
+            logger.debug(f"Response type: {type(response)}")
+            logger.debug(f"Response attributes: {dir(response)}")
+            logger.debug(f"Response repr: {repr(response)}")
 
             # Handle different response formats from lighter SDK
             account_data = None
             if hasattr(response, 'data') and response.data:
+                logger.debug(f"Using response.data[0], data length: {len(response.data)}")
                 account_data = response.data[0]
             elif hasattr(response, 'sub_accounts') and response.sub_accounts:
+                logger.debug(f"Using response.sub_accounts[0], sub_accounts length: {len(response.sub_accounts)}")
                 account_data = response.sub_accounts[0]
             elif hasattr(response, '__getitem__'):
-                # Response is directly indexable
+                logger.debug("Using response[0] (directly indexable)")
                 account_data = response[0]
             else:
-                # Response itself is the account data
+                logger.debug("Using response itself as account_data")
                 account_data = response
 
             if not account_data:
+                logger.warning(f"Account {account_num}: No account data found")
                 return (0.0, 0.0)
 
+            # Debug: Log account_data details
+            logger.debug(f"Account data type: {type(account_data)}")
+            logger.debug(f"Account data attributes: {dir(account_data)}")
+
             # Get available balance (USDC)
+            if hasattr(account_data, 'available_balance'):
+                logger.debug(f"Account {account_num} available_balance raw: {account_data.available_balance} (type: {type(account_data.available_balance)})")
+            else:
+                logger.warning(f"Account {account_num}: No 'available_balance' attribute")
+
             available_balance = float(account_data.available_balance) if hasattr(account_data, 'available_balance') and account_data.available_balance else 0.0
+            logger.info(f"Account {account_num} parsed available_balance: ${available_balance}")
 
             # Calculate total PnL (unrealized + realized)
             total_pnl = 0.0
             if hasattr(account_data, 'positions'):
+                logger.debug(f"Account {account_num} has {len(account_data.positions)} positions")
                 for position in account_data.positions:
                     unrealized_pnl = float(position.unrealized_pnl) if position.unrealized_pnl else 0.0
                     realized_pnl = float(position.realized_pnl) if position.realized_pnl else 0.0
                     total_pnl += unrealized_pnl + realized_pnl
+                    logger.debug(f"Position: unrealized={unrealized_pnl}, realized={realized_pnl}")
+            else:
+                logger.debug(f"Account {account_num}: No 'positions' attribute")
 
+            logger.info(f"Account {account_num} total PnL: ${total_pnl}")
             return (available_balance, total_pnl)
 
         except Exception as e:
-            logger.error(f"Failed to get account {account_num} balance: {e}")
+            logger.error(f"Failed to get account {account_num} balance: {e}", exc_info=True)
             return (0.0, 0.0)
 
     async def get_account_position_count(self, account_num: int) -> int:
