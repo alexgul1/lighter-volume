@@ -278,8 +278,10 @@ def worker_main(account_num: int, config: Dict[str, Any],
     """
     import signal
 
-    # Ignore SIGINT in worker process - let it complete naturally
+    # Ignore SIGINT and SIGTERM in worker process - let it complete naturally
+    # This ensures proper shutdown with both Ctrl+C and PM2 process manager
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
     try:
         # Run async command

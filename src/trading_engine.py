@@ -264,7 +264,10 @@ class TradingEngine:
 
             # Handle different response formats from lighter SDK
             account_data = None
-            if hasattr(response, 'data') and response.data:
+            if hasattr(response, 'accounts') and response.accounts:
+                logger.debug(f"Using response.accounts[0], accounts length: {len(response.accounts)}")
+                account_data = response.accounts[0]
+            elif hasattr(response, 'data') and response.data:
                 logger.debug(f"Using response.data[0], data length: {len(response.data)}")
                 account_data = response.data[0]
             elif hasattr(response, 'sub_accounts') and response.sub_accounts:
@@ -321,7 +324,9 @@ class TradingEngine:
 
             # Handle different response formats from lighter SDK
             account_data = None
-            if hasattr(response, 'data') and response.data:
+            if hasattr(response, 'accounts') and response.accounts:
+                account_data = response.accounts[0]
+            elif hasattr(response, 'data') and response.data:
                 account_data = response.data[0]
             elif hasattr(response, 'sub_accounts') and response.sub_accounts:
                 account_data = response.sub_accounts[0]
@@ -499,18 +504,43 @@ class TradingEngine:
 
             detail = details_response.order_book_details[0]
 
-            # Debug OI calculation
-            logger.info(f"🔍 OI Debug for {token}:")
-            logger.info(f"  Raw OI from API: {detail.open_interest}")
-            logger.info(f"  Price: ${detail.last_trade_price}")
-            logger.info(f"  Size decimals: {detail.size_decimals}")
-            logger.info(f"  Price decimals: {detail.price_decimals}")
+            # Debug OI calculation - FULL DETAIL DUMP
+            logger.info(f"🔍 === FULL OrderBookDetail for {token} ===")
+            logger.info(f"  Type: {type(detail)}")
+            logger.info(f"  Dir: {dir(detail)}")
 
-            # OI is already in USDC - no conversion needed!
-            # The API returns open_interest directly in USDC
-            oi_in_usdc = float(detail.open_interest) if detail.open_interest else 0.0
+            # Log all attributes
+            for attr in dir(detail):
+                if not attr.startswith('_'):
+                    try:
+                        value = getattr(detail, attr)
+                        if not callable(value):
+                            logger.info(f"  {attr}: {value} (type: {type(value).__name__})")
+                    except Exception as e:
+                        logger.debug(f"  {attr}: <error: {e}>")
 
-            logger.info(f"  Final OI (USDC): ${oi_in_usdc:,.2f}")
+            logger.info(f"🔍 === OI Calculation ===")
+            logger.info(f"  detail.open_interest = {detail.open_interest}")
+            logger.info(f"  detail.last_trade_price = {detail.last_trade_price}")
+            logger.info(f"  detail.size_decimals = {detail.size_decimals}")
+            logger.info(f"  detail.price_decimals = {detail.price_decimals}")
+
+            # Try different OI calculation methods
+            oi_raw = float(detail.open_interest) if detail.open_interest else 0.0
+            oi_method1 = oi_raw  # As is
+            oi_method2 = (oi_raw / (10 ** detail.size_decimals)) * detail.last_trade_price  # Old formula
+            oi_method3 = oi_raw * (10 ** detail.size_decimals)  # Multiply
+            oi_method4 = oi_raw / (10 ** detail.price_decimals)  # Price decimals
+
+            logger.info(f"  Method 1 (raw): ${oi_method1:,.2f}")
+            logger.info(f"  Method 2 (old formula): ${oi_method2:,.2f}")
+            logger.info(f"  Method 3 (multiply size_decimals): ${oi_method3:,.2f}")
+            logger.info(f"  Method 4 (price_decimals): ${oi_method4:,.2f}")
+
+            # Use method 1 for now (raw value)
+            oi_in_usdc = oi_method1
+            logger.info(f"  Using: ${oi_in_usdc:,.2f}")
+            logger.info(f"🔍 === End Debug ===")
 
             market_data = MarketData(
                 symbol=detail.symbol,
@@ -1007,7 +1037,9 @@ class TradingEngine:
 
             # Handle different response formats
             account_data = None
-            if hasattr(response, 'data') and response.data:
+            if hasattr(response, 'accounts') and response.accounts:
+                account_data = response.accounts[0]
+            elif hasattr(response, 'data') and response.data:
                 account_data = response.data[0]
             elif hasattr(response, 'sub_accounts') and response.sub_accounts:
                 account_data = response.sub_accounts[0]
@@ -1093,8 +1125,11 @@ class TradingEngine:
             # Calculate hold time
             hold_time_hours = (time.time() - position.open_time) / 3600
 
+            # Format PnL string
+            pnl_str = f"${pnl:.2f}" if pnl is not None else "N/A"
+
             logger.info(f"✅ Closed {position.position_type} {position.token} on Account {position.account_num} "
-                        f"(ID: {position_id}, Remaining: {remaining}, PnL: ${pnl:.2f if pnl else 'N/A'})")
+                        f"(ID: {position_id}, Remaining: {remaining}, PnL: {pnl_str})")
             logger.info(self.stats.get_stats_string())
 
             # Send Telegram notification for single position close

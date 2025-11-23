@@ -99,7 +99,9 @@ class PositionMonitor:
 
             # Handle different response formats from lighter SDK
             account_data = None
-            if hasattr(response, 'data') and response.data:
+            if hasattr(response, 'accounts') and response.accounts:
+                account_data = response.accounts[0]
+            elif hasattr(response, 'data') and response.data:
                 account_data = response.data[0]
             elif hasattr(response, 'sub_accounts') and response.sub_accounts:
                 account_data = response.sub_accounts[0]
