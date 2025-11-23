@@ -199,10 +199,7 @@ class TradingEngine:
         """Set leverage for all trading markets on both accounts"""
         imf = int(10000 / Config.DEFAULT_LEVERAGE)
 
-        # Sync nonces BEFORE leverage updates to ensure we start with correct nonce
-        logger.info("Syncing nonces before leverage updates...")
-        await self.sync_nonce_from_api(1)
-        await self.sync_nonce_from_api(2)
+        logger.info("Setting leverage for all trading markets...")
 
         for token in Config.TRADING_TOKENS:
             market_index = Config.MARKET_INDICES.get(token)
@@ -243,12 +240,12 @@ class TradingEngine:
         market_index: int,
         imf: int
     ):
-        """Set leverage for a single market with retry logic for nonce errors"""
-        max_retries = 2
+        """Set leverage for a single market with retry logic for transient errors"""
+        max_retries = 3
 
         for attempt in range(max_retries):
             try:
-                # Sign leverage update
+                # Fetch fresh nonce and sign leverage update
                 tx_info, error = client.sign_update_leverage(
                     market_index=market_index,
                     fraction=imf,
@@ -271,18 +268,14 @@ class TradingEngine:
 
             except Exception as e:
                 error_str = str(e).lower()
-                # Check if this is a nonce error
-                if "invalid nonce" in error_str or "nonce" in error_str:
-                    logger.warning(f"Nonce error setting leverage for {token} on Account {account_num} (attempt {attempt + 1}/{max_retries}): {e}")
-                    if attempt < max_retries - 1:
-                        # Sync nonce from API and retry
-                        await self.sync_nonce_from_api(account_num)
-                        await asyncio.sleep(0.5)
-                        continue
-
-                # Log error and continue with other markets
-                logger.error(f"Failed to set leverage for {token} on Account {account_num}: {e}")
-                return
+                if attempt < max_retries - 1:
+                    logger.warning(f"Error setting leverage for {token} on Account {account_num} (attempt {attempt + 1}/{max_retries}): {e}")
+                    await asyncio.sleep(1.0)  # Wait before retry
+                    continue
+                else:
+                    # Final attempt failed
+                    logger.error(f"Failed to set leverage for {token} on Account {account_num} after {max_retries} attempts: {e}")
+                    return
 
     async def cleanup(self):
         """Cleanup resources"""
@@ -603,40 +596,37 @@ class TradingEngine:
             return index
 
     async def get_next_nonce(self, account_num: int) -> int:
-        """Get next nonce for specified account"""
+        """
+        Get next nonce for specified account by fetching fresh from API.
+        This eliminates all synchronization issues by always using the server as source of truth.
+        """
         async with self._nonce_lock:
-            if account_num == 1:
-                nonce = self.current_nonce_1
-                self.current_nonce_1 += 1
-            else:
-                nonce = self.current_nonce_2
-                self.current_nonce_2 += 1
-            return nonce
-
-    async def sync_nonce_from_api(self, account_num: int):
-        """
-        Synchronize nonce with API (fetch latest from server).
-        Use this when nonce gets out of sync.
-        """
-        try:
-            if account_num == 1:
-                next_nonce = await self.transaction_api.next_nonce(
-                    account_index=Config.ACCOUNT_1_INDEX,
-                    api_key_index=Config.ACCOUNT_1_API_KEY_INDEX
-                )
-                async with self._nonce_lock:
-                    self.current_nonce_1 = next_nonce.nonce
-                    logger.info(f"Synced nonce for Account 1: {self.current_nonce_1}")
-            else:
-                next_nonce = await self.transaction_api.next_nonce(
-                    account_index=Config.ACCOUNT_2_INDEX,
-                    api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
-                )
-                async with self._nonce_lock:
-                    self.current_nonce_2 = next_nonce.nonce
-                    logger.info(f"Synced nonce for Account 2: {self.current_nonce_2}")
-        except Exception as e:
-            logger.error(f"Failed to sync nonce for Account {account_num}: {e}")
+            try:
+                if account_num == 1:
+                    next_nonce = await self.transaction_api.next_nonce(
+                        account_index=Config.ACCOUNT_1_INDEX,
+                        api_key_index=Config.ACCOUNT_1_API_KEY_INDEX
+                    )
+                    nonce = next_nonce.nonce
+                    logger.debug(f"Fetched fresh nonce for Account 1: {nonce}")
+                else:
+                    next_nonce = await self.transaction_api.next_nonce(
+                        account_index=Config.ACCOUNT_2_INDEX,
+                        api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
+                    )
+                    nonce = next_nonce.nonce
+                    logger.debug(f"Fetched fresh nonce for Account 2: {nonce}")
+                return nonce
+            except Exception as e:
+                logger.error(f"Failed to fetch nonce for Account {account_num}: {e}")
+                # Fallback to cached nonce if API call fails
+                if account_num == 1:
+                    nonce = self.current_nonce_1
+                    self.current_nonce_1 += 1
+                else:
+                    nonce = self.current_nonce_2
+                    self.current_nonce_2 += 1
+                return nonce
 
     async def full_restart(self):
         """Perform full restart: close everything and reinitialize"""
@@ -888,11 +878,11 @@ class TradingEngine:
         # Select the appropriate client
         client = self.client_1 if account_num == 1 else self.client_2
 
-        # Retry logic for nonce errors
-        max_retries = 2
+        # Retry logic for transient errors
+        max_retries = 3
         for attempt in range(max_retries):
             try:
-                # Get order index and nonce for this account
+                # Get order index and fresh nonce for this account
                 order_index = await self.get_next_order_index(account_num)
                 nonce = await self.get_next_nonce(account_num)
 
@@ -925,16 +915,11 @@ class TradingEngine:
                 break
 
             except Exception as e:
-                error_str = str(e).lower()
-                # Check if this is a nonce error
-                if "invalid nonce" in error_str or "nonce" in error_str:
-                    logger.warning(f"Nonce error on Account {account_num} (attempt {attempt + 1}/{max_retries}): {e}")
-                    if attempt < max_retries - 1:
-                        # Sync nonce from API and retry
-                        await self.sync_nonce_from_api(account_num)
-                        await asyncio.sleep(0.5)  # Small delay before retry
-                        continue
-                # Re-raise if not nonce error or last attempt
+                if attempt < max_retries - 1:
+                    logger.warning(f"Error opening position on Account {account_num} (attempt {attempt + 1}/{max_retries}): {e}")
+                    await asyncio.sleep(1.0)  # Wait before retry
+                    continue
+                # Re-raise on final attempt
                 raise
 
         # Success - log and create position
@@ -1036,11 +1021,11 @@ class TradingEngine:
         logger.info(f"📉 Closing {position.position_type.upper()} {position.token} on Account {position.account_num} "
                     f"(ID: {position_id})")
 
-        # Retry logic for nonce errors
-        max_retries = 2
+        # Retry logic for transient errors
+        max_retries = 3
         for attempt in range(max_retries):
             try:
-                # Get order index and nonce for this account
+                # Get order index and fresh nonce for this account
                 order_index = await self.get_next_order_index(position.account_num)
                 nonce = await self.get_next_nonce(position.account_num)
 
@@ -1073,16 +1058,11 @@ class TradingEngine:
                 break
 
             except Exception as e:
-                error_str = str(e).lower()
-                # Check if this is a nonce error
-                if "invalid nonce" in error_str or "nonce" in error_str:
-                    logger.warning(f"Nonce error closing position on Account {position.account_num} (attempt {attempt + 1}/{max_retries}): {e}")
-                    if attempt < max_retries - 1:
-                        # Sync nonce from API and retry
-                        await self.sync_nonce_from_api(position.account_num)
-                        await asyncio.sleep(0.5)  # Small delay before retry
-                        continue
-                # Re-raise if not nonce error or last attempt
+                if attempt < max_retries - 1:
+                    logger.warning(f"Error closing position on Account {position.account_num} (attempt {attempt + 1}/{max_retries}): {e}")
+                    await asyncio.sleep(1.0)  # Wait before retry
+                    continue
+                # Re-raise on final attempt
                 raise
 
         # Success - log and cleanup
