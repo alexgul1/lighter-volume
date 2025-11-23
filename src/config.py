@@ -78,8 +78,28 @@ class Config:
     TELEGRAM_ENABLE_NOTIFICATIONS = os.getenv("TELEGRAM_ENABLE_NOTIFICATIONS", "true").lower() == "true"
 
     # Position Monitoring (for real-time PnL tracking)
-    ENABLE_POSITION_MONITORING = os.getenv("ENABLE_POSITION_MONITORING", "true").lower() == "true"
-    POSITION_MONITOR_INTERVAL = float(os.getenv("POSITION_MONITOR_INTERVAL", "2.0"))  # seconds
+    # IMPORTANT: Aggressive monitoring uses many API calls!
+    # Standard accounts have only 10 req/min limit - monitoring disabled by default
+    # Premium accounts have 4000 req/min - can enable with shorter intervals
+    if IS_PREMIUM:
+        # Premium: Can afford frequent monitoring (5-10 seconds)
+        ENABLE_POSITION_MONITORING = os.getenv("ENABLE_POSITION_MONITORING", "true").lower() == "true"
+        POSITION_MONITOR_INTERVAL = float(os.getenv("POSITION_MONITOR_INTERVAL", "10.0"))  # 10 seconds safe
+    else:
+        # Standard: Disabled by default to respect rate limits
+        # If enabled, use very long intervals (60-120 seconds minimum)
+        ENABLE_POSITION_MONITORING = os.getenv("ENABLE_POSITION_MONITORING", "false").lower() == "true"
+        POSITION_MONITOR_INTERVAL = float(os.getenv("POSITION_MONITOR_INTERVAL", "90.0"))  # 90 seconds safe
+
+    # API Caching (to reduce API calls and respect rate limits)
+    # Premium accounts can use shorter TTLs, standard accounts need longer TTLs
+    if IS_PREMIUM:
+        MARKET_DATA_CACHE_TTL = float(os.getenv("MARKET_DATA_CACHE_TTL", "30"))  # 30 seconds
+        PRICE_CACHE_TTL = float(os.getenv("PRICE_CACHE_TTL", "5"))  # 5 seconds
+    else:
+        # Standard: Longer caching to minimize API usage
+        MARKET_DATA_CACHE_TTL = float(os.getenv("MARKET_DATA_CACHE_TTL", "120"))  # 2 minutes
+        PRICE_CACHE_TTL = float(os.getenv("PRICE_CACHE_TTL", "30"))  # 30 seconds
 
     # Logging
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

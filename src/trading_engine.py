@@ -83,7 +83,7 @@ class TradingEngine:
         # Market data cache
         self.market_data_cache: Dict[str, MarketData] = {}  # token -> MarketData
         self.cache_timestamp = 0
-        self.cache_ttl = 30  # Cache market data for 30 seconds
+        self.cache_ttl = Config.MARKET_DATA_CACHE_TTL  # Adaptive caching based on account type
 
         # Track order indices per account (for worker processes)
         self.next_order_index_1 = 1000
@@ -135,7 +135,17 @@ class TradingEngine:
                     message_thread_id=int(Config.TELEGRAM_TOPIC_ID) if Config.TELEGRAM_TOPIC_ID else None
                 )
                 await self.telegram.initialize()
-                logger.info("Telegram notifications enabled")
+
+                # Register Telegram commands
+                self.telegram.register_command("balance", self._handle_balance_command)
+                self.telegram.register_command("pnl", self._handle_pnl_command)
+                self.telegram.register_command("status", self._handle_status_command)
+                self.telegram.register_command("help", self._handle_help_command)
+
+                # Start command polling
+                await self.telegram.start_command_polling()
+
+                logger.info("Telegram notifications and commands enabled")
             else:
                 logger.warning("Telegram notifications disabled")
 
@@ -184,7 +194,8 @@ class TradingEngine:
             else:
                 logger.error(f"❌ Failed to set leverage for {token} on Account 1")
 
-            await asyncio.sleep(0.5)
+            # Respect rate limits between API calls
+            await asyncio.sleep(Config.SAFE_DELAY_BETWEEN_TRADES)
 
             # Set leverage on Account 2 via worker process
             success_2 = await self.account_manager.set_leverage(
@@ -199,7 +210,8 @@ class TradingEngine:
             else:
                 logger.error(f"❌ Failed to set leverage for {token} on Account 2")
 
-            await asyncio.sleep(0.5)
+            # Respect rate limits between markets
+            await asyncio.sleep(Config.SAFE_DELAY_BETWEEN_TRADES)
 
         logger.info("✅ Leverage updates completed for all markets")
 
@@ -211,6 +223,190 @@ class TradingEngine:
             await self.telegram.cleanup()
         if self.api_client:
             await self.api_client.close()
+
+    async def get_account_balance(self, account_num: int) -> Tuple[float, float]:
+        """
+        Get account balance and PnL.
+
+        Args:
+            account_num: Account number (1 or 2)
+
+        Returns:
+            Tuple of (available_balance, total_pnl)
+        """
+        try:
+            account_index = Config.ACCOUNT_1_INDEX if account_num == 1 else Config.ACCOUNT_2_INDEX
+            response = await self.account_api.account(by="index", value=str(account_index))
+
+            if not response.data:
+                return (0.0, 0.0)
+
+            account_data = response.data[0]
+
+            # Get available balance (USDC)
+            available_balance = float(account_data.available_balance) if account_data.available_balance else 0.0
+
+            # Calculate total PnL (unrealized + realized)
+            total_pnl = 0.0
+            for position in account_data.positions:
+                unrealized_pnl = float(position.unrealized_pnl) if position.unrealized_pnl else 0.0
+                realized_pnl = float(position.realized_pnl) if position.realized_pnl else 0.0
+                total_pnl += unrealized_pnl + realized_pnl
+
+            return (available_balance, total_pnl)
+
+        except Exception as e:
+            logger.error(f"Failed to get account {account_num} balance: {e}")
+            return (0.0, 0.0)
+
+    async def get_account_position_count(self, account_num: int) -> int:
+        """Get number of open positions for an account"""
+        try:
+            account_index = Config.ACCOUNT_1_INDEX if account_num == 1 else Config.ACCOUNT_2_INDEX
+            response = await self.account_api.account(by="index", value=str(account_index))
+
+            if not response.data:
+                return 0
+
+            account_data = response.data[0]
+            count = sum(1 for pos in account_data.positions if float(pos.position) != 0)
+            return count
+
+        except Exception as e:
+            logger.error(f"Failed to get account {account_num} position count: {e}")
+            return 0
+
+    async def check_and_alert_low_balance(self):
+        """Check both accounts for low balance and send alerts if needed"""
+        min_balance = Config.MAX_TRADE_AMOUNT * 3
+
+        # Check Account 1
+        balance_1, _ = await self.get_account_balance(1)
+        if balance_1 < min_balance and self.telegram:
+            await self.telegram.notify_low_balance_alert(
+                account_num=1,
+                current_balance=balance_1,
+                min_balance=min_balance,
+                max_trade_amount=Config.MAX_TRADE_AMOUNT
+            )
+
+        # Check Account 2
+        balance_2, _ = await self.get_account_balance(2)
+        if balance_2 < min_balance and self.telegram:
+            await self.telegram.notify_low_balance_alert(
+                account_num=2,
+                current_balance=balance_2,
+                min_balance=min_balance,
+                max_trade_amount=Config.MAX_TRADE_AMOUNT
+            )
+
+    async def send_balance_notification(self):
+        """Send balance and PnL notification after position close"""
+        if not self.telegram:
+            return
+
+        try:
+            # Get balances and PnL for both accounts
+            balance_1, pnl_1 = await self.get_account_balance(1)
+            balance_2, pnl_2 = await self.get_account_balance(2)
+
+            total_balance = balance_1 + balance_2
+            total_pnl = pnl_1 + pnl_2
+            min_balance = Config.MAX_TRADE_AMOUNT * 3
+
+            await self.telegram.notify_balance_after_close(
+                account_1_balance=balance_1,
+                account_1_pnl=pnl_1,
+                account_2_balance=balance_2,
+                account_2_pnl=pnl_2,
+                total_balance=total_balance,
+                total_pnl=total_pnl,
+                min_balance_threshold=min_balance
+            )
+
+            # Check and send low balance alerts
+            await self.check_and_alert_low_balance()
+
+        except Exception as e:
+            logger.error(f"Failed to send balance notification: {e}")
+
+    # Telegram command handlers
+    async def _handle_balance_command(self) -> str:
+        """Handle /balance command"""
+        try:
+            balance_1, _ = await self.get_account_balance(1)
+            balance_2, _ = await self.get_account_balance(2)
+            total_balance = balance_1 + balance_2
+
+            return (
+                f"💰 <b>Account Balances</b>\n\n"
+                f"<b>Account 1:</b> ${balance_1:,.2f}\n"
+                f"<b>Account 2:</b> ${balance_2:,.2f}\n"
+                f"<b>Total:</b> ${total_balance:,.2f}\n"
+                f"\n⏰ {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}"
+            )
+        except Exception as e:
+            return f"❌ Error fetching balances: {e}"
+
+    async def _handle_pnl_command(self) -> str:
+        """Handle /pnl command"""
+        try:
+            _, pnl_1 = await self.get_account_balance(1)
+            _, pnl_2 = await self.get_account_balance(2)
+            total_pnl = pnl_1 + pnl_2
+
+            pnl1_emoji = "💚" if pnl_1 >= 0 else "❤️"
+            pnl2_emoji = "💚" if pnl_2 >= 0 else "❤️"
+            total_pnl_emoji = "💚" if total_pnl >= 0 else "❤️"
+
+            return (
+                f"📊 <b>Profit & Loss</b>\n\n"
+                f"<b>Account 1:</b> {pnl1_emoji} ${pnl_1:+.2f}\n"
+                f"<b>Account 2:</b> {pnl2_emoji} ${pnl_2:+.2f}\n"
+                f"<b>Total:</b> {total_pnl_emoji} <b>${total_pnl:+.2f}</b>\n"
+                f"\n⏰ {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}"
+            )
+        except Exception as e:
+            return f"❌ Error fetching P/L: {e}"
+
+    async def _handle_status_command(self) -> str:
+        """Handle /status command"""
+        try:
+            balance_1, pnl_1 = await self.get_account_balance(1)
+            balance_2, pnl_2 = await self.get_account_balance(2)
+            pos_count_1 = await self.get_account_position_count(1)
+            pos_count_2 = await self.get_account_position_count(2)
+
+            uptime = (time.time() - self.start_time) / 3600
+
+            if self.telegram:
+                await self.telegram.notify_account_status(
+                    account_1_balance=balance_1,
+                    account_1_pnl=pnl_1,
+                    account_1_positions=pos_count_1,
+                    account_2_balance=balance_2,
+                    account_2_pnl=pnl_2,
+                    account_2_positions=pos_count_2,
+                    uptime_hours=uptime
+                )
+
+            return ""  # Already sent via notify_account_status
+        except Exception as e:
+            return f"❌ Error fetching status: {e}"
+
+    async def _handle_help_command(self) -> str:
+        """Handle /help command"""
+        return (
+            f"🤖 <b>Lighter Bot Commands</b>\n\n"
+            f"/balance - Show account balances\n"
+            f"/pnl - Show profit & loss\n"
+            f"/status - Full account status\n"
+            f"/help - Show this help message\n"
+            f"\n<b>Bot Info:</b>\n"
+            f"Strategy: Dual account hedging\n"
+            f"Tokens: {', '.join(Config.TRADING_TOKENS)}\n"
+            f"Leverage: {Config.DEFAULT_LEVERAGE}x\n"
+        )
 
     async def get_market_data(self, token: str, force_refresh: bool = False) -> Optional[MarketData]:
         """
@@ -259,13 +455,21 @@ class TradingEngine:
             return None
 
     async def get_all_market_data(self) -> Dict[str, MarketData]:
-        """Get market data for all trading tokens"""
+        """
+        Get market data for all trading tokens.
+        Uses rate-limit-friendly delays between requests.
+        """
         market_data = {}
-        for token in Config.TRADING_TOKENS:
+        for i, token in enumerate(Config.TRADING_TOKENS):
             data = await self.get_market_data(token, force_refresh=True)
             if data:
                 market_data[token] = data
-            await asyncio.sleep(0.1)  # Small delay between requests
+
+            # Add delay between requests (except after last one)
+            # Standard: 7s delay, Premium: 0.5s delay
+            if i < len(Config.TRADING_TOKENS) - 1:
+                await asyncio.sleep(Config.SAFE_DELAY_BETWEEN_TRADES)
+
         return market_data
 
     async def select_low_oi_tokens(self) -> List[str]:
@@ -764,6 +968,9 @@ class TradingEngine:
                 # If paired position was already closed, send hedged pair summary
                 if not paired_pos:
                     await self._send_hedged_pair_summary(position, position_id)
+
+            # Send balance notification after closing position
+            await self.send_balance_notification()
 
         except Exception as e:
             logger.error(f"Failed to close position {position_id}: {e}")
