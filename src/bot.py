@@ -27,13 +27,18 @@ class TradingBot:
 
             # Show configuration
             logger.info("=" * 60)
-            logger.info("LIGHTER FUTURES TRADING BOT")
+            logger.info("LIGHTER HEDGED FUTURES TRADING BOT")
             logger.info("=" * 60)
-            logger.info(f"Account Type: {Config.ACCOUNT_TYPE.upper()}")
+            logger.info(f"Strategy: Dual Account Hedging (Long/Short Pairs)")
+            logger.info(f"Account 1: Index {Config.ACCOUNT_1_INDEX}")
+            logger.info(f"Account 2: Index {Config.ACCOUNT_2_INDEX}")
             logger.info(f"Leverage: {Config.DEFAULT_LEVERAGE}x")
             logger.info(f"Tokens: {Config.TRADING_TOKENS}")
             logger.info(f"Position Size: ${Config.MIN_TRADE_AMOUNT}-${Config.MAX_TRADE_AMOUNT}")
-            logger.info(f"Hold Time: {Config.POSITION_HOLD_TIME_MIN}-{Config.POSITION_HOLD_TIME_MAX}s")
+            logger.info(f"Hold Time: {Config.POSITION_HOLD_TIME_MIN/3600:.1f}h-{Config.POSITION_HOLD_TIME_MAX/3600:.1f}h")
+            logger.info(f"Amount Variance: {Config.TRADE_AMOUNT_VARIANCE_PERCENT}%")
+            logger.info(f"Timing Delay: {Config.TRADE_TIMING_DELAY_MIN}-{Config.TRADE_TIMING_DELAY_MAX}s")
+            logger.info(f"Low OI Filter: {'Enabled' if Config.ENABLE_LOW_OI_FILTER else 'Disabled'}")
             logger.info("=" * 60)
 
             # Initialize database

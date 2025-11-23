@@ -28,8 +28,8 @@ async def main():
 if __name__ == "__main__":
     print("""
     ╔══════════════════════════════════════════════════════════╗
-    ║          LIGHTER FUTURES TRADING BOT                     ║
-    ║          Points Farming - Zero Fees (Standard)           ║
+    ║       LIGHTER HEDGED FUTURES TRADING BOT                 ║
+    ║       Low OI Farming - Dual Account Strategy             ║
     ╚══════════════════════════════════════════════════════════╝
     """)
 
