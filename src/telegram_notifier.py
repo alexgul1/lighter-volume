@@ -1,6 +1,6 @@
 import asyncio
 import aiohttp
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Callable, Awaitable
 from datetime import datetime
 from src.utils import setup_logger
 from src.config import Config
@@ -30,6 +30,12 @@ class TelegramNotifier:
         self.session: Optional[aiohttp.ClientSession] = None
         self.enabled = bool(bot_token and chat_id)
 
+        # Command handling
+        self.command_handlers: Dict[str, Callable[[], Awaitable[str]]] = {}
+        self.last_update_id = 0
+        self.polling_task: Optional[asyncio.Task] = None
+        self.polling_enabled = False
+
         if not self.enabled:
             logger.warning("Telegram notifications disabled (missing token or chat_id)")
         else:
@@ -47,9 +53,114 @@ class TelegramNotifier:
                 logger.error(f"Failed to send test message to Telegram: {e}")
 
     async def cleanup(self):
-        """Cleanup HTTP session"""
+        """Cleanup HTTP session and stop command polling"""
+        # Stop command polling
+        if self.polling_task:
+            self.polling_enabled = False
+            self.polling_task.cancel()
+            try:
+                await self.polling_task
+            except asyncio.CancelledError:
+                pass
+
+        # Close session
         if self.session:
             await self.session.close()
+
+    def register_command(self, command: str, handler: Callable[[], Awaitable[str]]):
+        """
+        Register a command handler.
+
+        Args:
+            command: Command name (without leading /)
+            handler: Async function that returns response text
+        """
+        self.command_handlers[command] = handler
+        logger.info(f"Registered Telegram command: /{command}")
+
+    async def start_command_polling(self):
+        """Start polling for Telegram commands"""
+        if not self.enabled:
+            return
+
+        self.polling_enabled = True
+        self.polling_task = asyncio.create_task(self._command_polling_loop())
+        logger.info("Started Telegram command polling")
+
+    async def _command_polling_loop(self):
+        """Background task for polling Telegram commands"""
+        while self.polling_enabled:
+            try:
+                await self._poll_commands()
+                await asyncio.sleep(2)  # Poll every 2 seconds
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Command polling error: {e}")
+                await asyncio.sleep(5)
+
+    async def _poll_commands(self):
+        """Poll for new Telegram commands"""
+        if not self.session:
+            return
+
+        try:
+            params = {
+                "offset": self.last_update_id + 1,
+                "timeout": 1,  # Short timeout for non-blocking
+                "allowed_updates": ["message"]
+            }
+
+            async with self.session.get(
+                f"{self.base_url}/getUpdates",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as response:
+                if response.status != 200:
+                    return
+
+                data = await response.json()
+                if not data.get("ok"):
+                    return
+
+                updates = data.get("result", [])
+                for update in updates:
+                    self.last_update_id = update["update_id"]
+                    await self._handle_update(update)
+
+        except asyncio.TimeoutError:
+            pass
+        except Exception as e:
+            logger.debug(f"Polling error: {e}")
+
+    async def _handle_update(self, update: Dict[str, Any]):
+        """Handle a single Telegram update"""
+        message = update.get("message")
+        if not message:
+            return
+
+        # Check if message is from our configured chat
+        chat_id = str(message.get("chat", {}).get("id", ""))
+        if chat_id != str(self.chat_id):
+            return
+
+        text = message.get("text", "")
+        if not text.startswith("/"):
+            return
+
+        # Extract command (remove leading / and parameters)
+        command = text[1:].split()[0].lower()
+
+        # Find and execute handler
+        handler = self.command_handlers.get(command)
+        if handler:
+            try:
+                logger.info(f"Executing command: /{command}")
+                response = await handler()
+                await self.send_message(response)
+            except Exception as e:
+                logger.error(f"Command handler error for /{command}: {e}")
+                await self.send_message(f"❌ Error executing command: {e}")
 
     async def send_message(self, text: str, parse_mode: str = "HTML") -> bool:
         """
@@ -301,6 +412,150 @@ class TelegramNotifier:
             f"<b>Failed:</b> {failed_trades}\n"
             f"<b>Success Rate:</b> {(successful_trades/(total_positions or 1))*100:.1f}%\n"
             f"<b>Net P/L:</b> {pnl_emoji} <b>${total_pnl:+.2f}</b>\n"
+            f"\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        )
+
+        await self.send_message(message)
+
+    async def notify_balance_after_close(
+        self,
+        account_1_balance: float,
+        account_1_pnl: float,
+        account_2_balance: float,
+        account_2_pnl: float,
+        total_balance: float,
+        total_pnl: float,
+        min_balance_threshold: float
+    ):
+        """
+        Notify account balances and PnL after position close.
+
+        Args:
+            account_1_balance: Available balance on Account 1 (USDC)
+            account_1_pnl: Total PnL on Account 1
+            account_2_balance: Available balance on Account 2 (USDC)
+            account_2_pnl: Total PnL on Account 2
+            total_balance: Combined balance
+            total_pnl: Combined PnL
+            min_balance_threshold: Minimum recommended balance (MAX_TRADE_AMOUNT * 3)
+        """
+        message = "💰 <b>Account Balances</b>\n\n"
+
+        # Account 1
+        acc1_emoji = "✅" if account_1_balance >= min_balance_threshold else "⚠️"
+        pnl1_emoji = "💚" if account_1_pnl >= 0 else "❤️"
+        message += (
+            f"{acc1_emoji} <b>Account 1:</b>\n"
+            f"  Balance: ${account_1_balance:,.2f}\n"
+            f"  PnL: {pnl1_emoji} ${account_1_pnl:+.2f}\n"
+        )
+        if account_1_balance < min_balance_threshold:
+            message += f"  ⚠️ Low balance! (min: ${min_balance_threshold:,.2f})\n"
+        message += "\n"
+
+        # Account 2
+        acc2_emoji = "✅" if account_2_balance >= min_balance_threshold else "⚠️"
+        pnl2_emoji = "💚" if account_2_pnl >= 0 else "❤️"
+        message += (
+            f"{acc2_emoji} <b>Account 2:</b>\n"
+            f"  Balance: ${account_2_balance:,.2f}\n"
+            f"  PnL: {pnl2_emoji} ${account_2_pnl:+.2f}\n"
+        )
+        if account_2_balance < min_balance_threshold:
+            message += f"  ⚠️ Low balance! (min: ${min_balance_threshold:,.2f})\n"
+        message += "\n"
+
+        # Total
+        total_pnl_emoji = "💚" if total_pnl >= 0 else "❤️"
+        message += (
+            f"<b>Total:</b>\n"
+            f"  Balance: ${total_balance:,.2f}\n"
+            f"  PnL: {total_pnl_emoji} <b>${total_pnl:+.2f}</b>\n"
+            f"\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        )
+
+        await self.send_message(message)
+
+    async def notify_low_balance_alert(
+        self,
+        account_num: int,
+        current_balance: float,
+        min_balance: float,
+        max_trade_amount: float
+    ):
+        """
+        Send alert when account balance is too low.
+
+        Args:
+            account_num: Account number (1 or 2)
+            current_balance: Current available balance (USDC)
+            min_balance: Minimum required balance (MAX_TRADE_AMOUNT * 3)
+            max_trade_amount: Maximum trade size
+        """
+        deficit = min_balance - current_balance
+
+        message = (
+            f"🚨 <b>LOW BALANCE ALERT</b>\n\n"
+            f"<b>Account {account_num}</b> has insufficient funds!\n\n"
+            f"<b>Current Balance:</b> ${current_balance:,.2f}\n"
+            f"<b>Minimum Required:</b> ${min_balance:,.2f}\n"
+            f"<b>Deficit:</b> <b>${deficit:,.2f}</b>\n\n"
+            f"<b>Max Trade Size:</b> ${max_trade_amount:.2f}\n"
+            f"<b>Trades Remaining:</b> ~{int(current_balance / max_trade_amount)}\n\n"
+            f"⚠️ <b>Action Required:</b> Deposit at least ${deficit:,.2f} to Account {account_num}\n"
+            f"\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        )
+
+        await self.send_message(message)
+
+    async def notify_account_status(
+        self,
+        account_1_balance: float,
+        account_1_pnl: float,
+        account_1_positions: int,
+        account_2_balance: float,
+        account_2_pnl: float,
+        account_2_positions: int,
+        uptime_hours: float
+    ):
+        """
+        Send current account status (used for /balance and /status commands).
+
+        Args:
+            account_1_balance: Available balance on Account 1
+            account_1_pnl: Total PnL on Account 1
+            account_1_positions: Number of open positions on Account 1
+            account_2_balance: Available balance on Account 2
+            account_2_pnl: Total PnL on Account 2
+            account_2_positions: Number of open positions on Account 2
+            uptime_hours: Bot uptime in hours
+        """
+        total_balance = account_1_balance + account_2_balance
+        total_pnl = account_1_pnl + account_2_pnl
+        total_positions = account_1_positions + account_2_positions
+
+        pnl1_emoji = "💚" if account_1_pnl >= 0 else "❤️"
+        pnl2_emoji = "💚" if account_2_pnl >= 0 else "❤️"
+        total_pnl_emoji = "💚" if total_pnl >= 0 else "❤️"
+
+        message = (
+            f"📊 <b>Account Status</b>\n\n"
+            f"⏱ <b>Uptime:</b> {uptime_hours:.1f}h\n\n"
+
+            f"<b>Account 1:</b>\n"
+            f"  Balance: ${account_1_balance:,.2f}\n"
+            f"  PnL: {pnl1_emoji} ${account_1_pnl:+.2f}\n"
+            f"  Open Positions: {account_1_positions}\n\n"
+
+            f"<b>Account 2:</b>\n"
+            f"  Balance: ${account_2_balance:,.2f}\n"
+            f"  PnL: {pnl2_emoji} ${account_2_pnl:+.2f}\n"
+            f"  Open Positions: {account_2_positions}\n\n"
+
+            f"<b>Total:</b>\n"
+            f"  Balance: ${total_balance:,.2f}\n"
+            f"  PnL: {total_pnl_emoji} <b>${total_pnl:+.2f}</b>\n"
+            f"  Total Positions: {total_positions}\n"
             f"\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}"
         )
 
