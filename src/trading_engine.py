@@ -129,29 +129,31 @@ class TradingEngine:
             self.current_nonce_1 = next_nonce_1.nonce
             logger.info(f"✅ Initial nonce for Account 1: {self.current_nonce_1}")
 
-            # Initialize Account 2 (Secondary)
-            self.client_2 = lighter.SignerClient(
-                url=Config.BASE_URL,
-                private_key=Config.ACCOUNT_2_PRIVATE_KEY,
-                account_index=Config.ACCOUNT_2_INDEX,
-                api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
-            )
+            # TEMPORARILY DISABLED: Initialize Account 2 (Secondary)
+            # Testing if issue is caused by dual client initialization
+            logger.warning("⚠️ Account 2 initialization DISABLED for testing")
+            # self.client_2 = lighter.SignerClient(
+            #     url=Config.BASE_URL,
+            #     private_key=Config.ACCOUNT_2_PRIVATE_KEY,
+            #     account_index=Config.ACCOUNT_2_INDEX,
+            #     api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
+            # )
+            #
+            # # Check Account 2
+            # err = self.client_2.check_client()
+            # if err is not None:
+            #     raise Exception(f"Account 2 client check failed: {err}")
+            #
+            # # Get initial nonce for Account 2
+            # logger.info(f"🔍 Fetching initial nonce for Account 2 (index={Config.ACCOUNT_2_INDEX})")
+            # next_nonce_2 = await self.transaction_api.next_nonce(
+            #     account_index=Config.ACCOUNT_2_INDEX,
+            #     api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
+            # )
+            # self.current_nonce_2 = next_nonce_2.nonce
+            # logger.info(f"✅ Initial nonce for Account 2: {self.current_nonce_2}")
 
-            # Check Account 2
-            err = self.client_2.check_client()
-            if err is not None:
-                raise Exception(f"Account 2 client check failed: {err}")
-
-            # Get initial nonce for Account 2
-            logger.info(f"🔍 Fetching initial nonce for Account 2 (index={Config.ACCOUNT_2_INDEX})")
-            next_nonce_2 = await self.transaction_api.next_nonce(
-                account_index=Config.ACCOUNT_2_INDEX,
-                api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
-            )
-            self.current_nonce_2 = next_nonce_2.nonce
-            logger.info(f"✅ Initial nonce for Account 2: {self.current_nonce_2}")
-
-            # Set leverage for all markets on both accounts
+            # Set leverage for all markets on both accounts (now only Account 1)
             await self._set_leverage_for_markets()
 
             # Initialize Telegram notifications
@@ -200,10 +202,10 @@ class TradingEngine:
             raise
 
     async def _set_leverage_for_markets(self):
-        """Set leverage for all trading markets on both accounts"""
+        """Set leverage for all trading markets (TESTING: Account 1 only)"""
         imf = int(10000 / Config.DEFAULT_LEVERAGE)
 
-        logger.info("Setting leverage for all trading markets...")
+        logger.info("Setting leverage for all trading markets (Account 1 only)...")
 
         for token in Config.TRADING_TOKENS:
             market_index = Config.MARKET_INDICES.get(token)
@@ -222,17 +224,17 @@ class TradingEngine:
             # Respect rate limits between API calls
             await asyncio.sleep(Config.SAFE_DELAY_BETWEEN_TRADES)
 
-            # Set leverage on Account 2 with retry logic
-            await self._set_leverage_with_retry(
-                account_num=2,
-                client=self.client_2,
-                token=token,
-                market_index=market_index,
-                imf=imf
-            )
-
-            # Respect rate limits between markets
-            await asyncio.sleep(Config.SAFE_DELAY_BETWEEN_TRADES)
+            # TEMPORARILY DISABLED: Set leverage on Account 2
+            # await self._set_leverage_with_retry(
+            #     account_num=2,
+            #     client=self.client_2,
+            #     token=token,
+            #     market_index=market_index,
+            #     imf=imf
+            # )
+            #
+            # # Respect rate limits between markets
+            # await asyncio.sleep(Config.SAFE_DELAY_BETWEEN_TRADES)
 
         logger.info("✅ Leverage updates completed for all markets")
 
@@ -608,8 +610,6 @@ class TradingEngine:
         """
         Get next nonce for specified account by fetching fresh from API.
         This eliminates all synchronization issues by always using the server as source of truth.
-
-        IMPORTANT: The API returns the last USED nonce, so we must increment by 1 to get the next valid nonce.
         """
         async with self._nonce_lock:
             try:
@@ -619,18 +619,16 @@ class TradingEngine:
                         account_index=Config.ACCOUNT_1_INDEX,
                         api_key_index=Config.ACCOUNT_1_API_KEY_INDEX
                     )
-                    api_nonce = next_nonce.nonce
-                    nonce = api_nonce + 1  # API returns last used nonce, we need next one
-                    logger.info(f"✅ Received nonce for Account 1: {api_nonce}, using {nonce} (api_nonce + 1)")
+                    nonce = next_nonce.nonce
+                    logger.info(f"✅ Received nonce for Account 1: {nonce}")
                 else:
                     logger.info(f"🔍 Fetching fresh nonce for Account 2 (index={Config.ACCOUNT_2_INDEX}, api_key_index={Config.ACCOUNT_2_API_KEY_INDEX})")
                     next_nonce = await self.transaction_api.next_nonce(
                         account_index=Config.ACCOUNT_2_INDEX,
                         api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
                     )
-                    api_nonce = next_nonce.nonce
-                    nonce = api_nonce + 1  # API returns last used nonce, we need next one
-                    logger.info(f"✅ Received nonce for Account 2: {api_nonce}, using {nonce} (api_nonce + 1)")
+                    nonce = next_nonce.nonce
+                    logger.info(f"✅ Received nonce for Account 2: {nonce}")
                 return nonce
             except Exception as e:
                 logger.error(f"❌ Failed to fetch nonce for Account {account_num}: {e}")
