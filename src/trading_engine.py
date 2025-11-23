@@ -326,15 +326,29 @@ class TradingEngine:
         """
         try:
             account_index = Config.ACCOUNT_1_INDEX if account_num == 1 else Config.ACCOUNT_2_INDEX
+            logger.info(f"🔍 Fetching balance for Account {account_num} (index={account_index})")
+
             response = await self.account_api.account(by="index", value=str(account_index))
 
+            logger.info(f"📊 Account API response for Account {account_num}:")
+            logger.info(f"  - response: {response}")
+            logger.info(f"  - response.data: {response.data if hasattr(response, 'data') else 'NO DATA ATTR'}")
+            logger.info(f"  - response type: {type(response)}")
+            logger.info(f"  - response dir: {[attr for attr in dir(response) if not attr.startswith('_')]}")
+
             if not response.data:
+                logger.warning(f"⚠️ No data in response for Account {account_num}")
                 return (0.0, 0.0)
 
             account_data = response.data[0]
+            logger.info(f"📊 Account data for Account {account_num}:")
+            logger.info(f"  - account_data: {account_data}")
+            logger.info(f"  - type: {type(account_data)}")
+            logger.info(f"  - dir: {[attr for attr in dir(account_data) if not attr.startswith('_')]}")
 
             # Get available balance (USDC)
             available_balance = float(account_data.available_balance) if account_data.available_balance else 0.0
+            logger.info(f"💰 Available balance for Account {account_num}: {available_balance}")
 
             # Calculate total PnL (unrealized + realized)
             total_pnl = 0.0
@@ -343,10 +357,12 @@ class TradingEngine:
                 realized_pnl = float(position.realized_pnl) if position.realized_pnl else 0.0
                 total_pnl += unrealized_pnl + realized_pnl
 
+            logger.info(f"📈 Total PnL for Account {account_num}: {total_pnl}")
             return (available_balance, total_pnl)
 
         except Exception as e:
-            logger.error(f"Failed to get account {account_num} balance: {e}")
+            logger.error(f"❌ Failed to get account {account_num} balance: {e}")
+            logger.exception(e)
             return (0.0, 0.0)
 
     async def get_account_position_count(self, account_num: int) -> int:
