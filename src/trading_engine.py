@@ -100,14 +100,25 @@ class TradingEngine:
     async def initialize(self):
         """Initialize Lighter clients for dual account hedging"""
         try:
-            # Initialize API client
-            configuration = lighter.Configuration(Config.BASE_URL)
-            self.api_client = lighter.ApiClient(configuration)
-            self.transaction_api = lighter.TransactionApi(self.api_client)
-            self.order_api = lighter.OrderApi(self.api_client)
-            self.account_api = lighter.AccountApi(self.api_client)
+            # Create separate API clients for each account to avoid shared state conflicts
+            logger.info("🔧 Creating separate API clients for each account...")
+
+            # Account 1 API clients
+            configuration_1 = lighter.Configuration(Config.BASE_URL)
+            self.api_client_1 = lighter.ApiClient(configuration_1)
+            self.transaction_api_1 = lighter.TransactionApi(self.api_client_1)
+
+            # Account 2 API clients
+            configuration_2 = lighter.Configuration(Config.BASE_URL)
+            self.api_client_2 = lighter.ApiClient(configuration_2)
+            self.transaction_api_2 = lighter.TransactionApi(self.api_client_2)
+
+            # Shared API clients for read operations (order, account)
+            self.order_api = lighter.OrderApi(self.api_client_1)
+            self.account_api = lighter.AccountApi(self.api_client_1)
 
             # Initialize Account 1 (Primary)
+            logger.info("🔧 Initializing Account 1 SignerClient...")
             self.client_1 = lighter.SignerClient(
                 url=Config.BASE_URL,
                 private_key=Config.ACCOUNT_1_PRIVATE_KEY,
@@ -122,36 +133,35 @@ class TradingEngine:
 
             # Get initial nonce for Account 1
             logger.info(f"🔍 Fetching initial nonce for Account 1 (index={Config.ACCOUNT_1_INDEX})")
-            next_nonce_1 = await self.transaction_api.next_nonce(
+            next_nonce_1 = await self.transaction_api_1.next_nonce(
                 account_index=Config.ACCOUNT_1_INDEX,
                 api_key_index=Config.ACCOUNT_1_API_KEY_INDEX
             )
             self.current_nonce_1 = next_nonce_1.nonce
             logger.info(f"✅ Initial nonce for Account 1: {self.current_nonce_1}")
 
-            # TEMPORARILY DISABLED: Initialize Account 2 (Secondary)
-            # Testing if issue is caused by dual client initialization
-            logger.warning("⚠️ Account 2 initialization DISABLED for testing")
-            # self.client_2 = lighter.SignerClient(
-            #     url=Config.BASE_URL,
-            #     private_key=Config.ACCOUNT_2_PRIVATE_KEY,
-            #     account_index=Config.ACCOUNT_2_INDEX,
-            #     api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
-            # )
-            #
-            # # Check Account 2
-            # err = self.client_2.check_client()
-            # if err is not None:
-            #     raise Exception(f"Account 2 client check failed: {err}")
-            #
-            # # Get initial nonce for Account 2
-            # logger.info(f"🔍 Fetching initial nonce for Account 2 (index={Config.ACCOUNT_2_INDEX})")
-            # next_nonce_2 = await self.transaction_api.next_nonce(
-            #     account_index=Config.ACCOUNT_2_INDEX,
-            #     api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
-            # )
-            # self.current_nonce_2 = next_nonce_2.nonce
-            # logger.info(f"✅ Initial nonce for Account 2: {self.current_nonce_2}")
+            # Initialize Account 2 (Secondary) with separate API client
+            logger.info("🔧 Initializing Account 2 SignerClient...")
+            self.client_2 = lighter.SignerClient(
+                url=Config.BASE_URL,
+                private_key=Config.ACCOUNT_2_PRIVATE_KEY,
+                account_index=Config.ACCOUNT_2_INDEX,
+                api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
+            )
+
+            # Check Account 2
+            err = self.client_2.check_client()
+            if err is not None:
+                raise Exception(f"Account 2 client check failed: {err}")
+
+            # Get initial nonce for Account 2 using its own API client
+            logger.info(f"🔍 Fetching initial nonce for Account 2 (index={Config.ACCOUNT_2_INDEX})")
+            next_nonce_2 = await self.transaction_api_2.next_nonce(
+                account_index=Config.ACCOUNT_2_INDEX,
+                api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
+            )
+            self.current_nonce_2 = next_nonce_2.nonce
+            logger.info(f"✅ Initial nonce for Account 2: {self.current_nonce_2}")
 
             # Set leverage for all markets on both accounts (now only Account 1)
             await self._set_leverage_for_markets()
@@ -202,10 +212,10 @@ class TradingEngine:
             raise
 
     async def _set_leverage_for_markets(self):
-        """Set leverage for all trading markets (TESTING: Account 1 only)"""
+        """Set leverage for all trading markets on both accounts"""
         imf = int(10000 / Config.DEFAULT_LEVERAGE)
 
-        logger.info("Setting leverage for all trading markets (Account 1 only)...")
+        logger.info("Setting leverage for all trading markets on both accounts...")
 
         for token in Config.TRADING_TOKENS:
             market_index = Config.MARKET_INDICES.get(token)
@@ -224,17 +234,17 @@ class TradingEngine:
             # Respect rate limits between API calls
             await asyncio.sleep(Config.SAFE_DELAY_BETWEEN_TRADES)
 
-            # TEMPORARILY DISABLED: Set leverage on Account 2
-            # await self._set_leverage_with_retry(
-            #     account_num=2,
-            #     client=self.client_2,
-            #     token=token,
-            #     market_index=market_index,
-            #     imf=imf
-            # )
-            #
-            # # Respect rate limits between markets
-            # await asyncio.sleep(Config.SAFE_DELAY_BETWEEN_TRADES)
+            # Set leverage on Account 2 with retry logic
+            await self._set_leverage_with_retry(
+                account_num=2,
+                client=self.client_2,
+                token=token,
+                market_index=market_index,
+                imf=imf
+            )
+
+            # Respect rate limits between markets
+            await asyncio.sleep(Config.SAFE_DELAY_BETWEEN_TRADES)
 
         logger.info("✅ Leverage updates completed for all markets")
 
@@ -267,9 +277,10 @@ class TradingEngine:
                     logger.error(f"Failed to sign leverage update for {token} on Account {account_num}: {error}")
                     return
 
-                # Send transaction
+                # Send transaction using account-specific transaction API
                 logger.info(f"📤 Sending leverage update transaction for {token} on Account {account_num}")
-                await self.transaction_api.send_tx(
+                transaction_api = self.transaction_api_1 if account_num == 1 else self.transaction_api_2
+                await transaction_api.send_tx(
                     tx_type=client.TX_TYPE_UPDATE_LEVERAGE,
                     tx_info=tx_info
                 )
@@ -298,8 +309,10 @@ class TradingEngine:
             await self.client_1.close()
         if self.client_2:
             await self.client_2.close()
-        if self.api_client:
-            await self.api_client.close()
+        if hasattr(self, 'api_client_1') and self.api_client_1:
+            await self.api_client_1.close()
+        if hasattr(self, 'api_client_2') and self.api_client_2:
+            await self.api_client_2.close()
 
     async def get_account_balance(self, account_num: int) -> Tuple[float, float]:
         """
@@ -609,13 +622,13 @@ class TradingEngine:
     async def get_next_nonce(self, account_num: int) -> int:
         """
         Get next nonce for specified account by fetching fresh from API.
-        This eliminates all synchronization issues by always using the server as source of truth.
+        Uses separate transaction_api for each account to avoid shared state conflicts.
         """
         async with self._nonce_lock:
             try:
                 if account_num == 1:
                     logger.info(f"🔍 Fetching fresh nonce for Account 1 (index={Config.ACCOUNT_1_INDEX}, api_key_index={Config.ACCOUNT_1_API_KEY_INDEX})")
-                    next_nonce = await self.transaction_api.next_nonce(
+                    next_nonce = await self.transaction_api_1.next_nonce(
                         account_index=Config.ACCOUNT_1_INDEX,
                         api_key_index=Config.ACCOUNT_1_API_KEY_INDEX
                     )
@@ -623,7 +636,7 @@ class TradingEngine:
                     logger.info(f"✅ Received nonce for Account 1: {nonce}")
                 else:
                     logger.info(f"🔍 Fetching fresh nonce for Account 2 (index={Config.ACCOUNT_2_INDEX}, api_key_index={Config.ACCOUNT_2_API_KEY_INDEX})")
-                    next_nonce = await self.transaction_api.next_nonce(
+                    next_nonce = await self.transaction_api_2.next_nonce(
                         account_index=Config.ACCOUNT_2_INDEX,
                         api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
                     )
@@ -921,8 +934,9 @@ class TradingEngine:
                     self.consecutive_failures += 1
                     return None
 
-                # Send transaction
-                result = await self.transaction_api.send_tx(
+                # Send transaction using account-specific transaction API
+                transaction_api = self.transaction_api_1 if account_num == 1 else self.transaction_api_2
+                result = await transaction_api.send_tx(
                     tx_type=client.TX_TYPE_CREATE_ORDER,
                     tx_info=tx_info
                 )
@@ -1064,8 +1078,9 @@ class TradingEngine:
                     position.is_closing = False  # Reset flag on error
                     return
 
-                # Send transaction
-                result = await self.transaction_api.send_tx(
+                # Send transaction using account-specific transaction API
+                transaction_api = self.transaction_api_1 if position.account_num == 1 else self.transaction_api_2
+                result = await transaction_api.send_tx(
                     tx_type=client.TX_TYPE_CREATE_ORDER,
                     tx_info=tx_info
                 )
