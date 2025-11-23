@@ -16,8 +16,9 @@ Automated hedged futures trading bot for Lighter Protocol. Uses dual accounts to
 - **MongoDB Logging**: Complete audit trail of all positions
 - **Automatic Recovery**: Pauses and restarts on consecutive failures
 - **Telegram Notifications**: Real-time alerts for trades, positions, P/L, and errors
-- **Real-Time Position Monitoring**: Tracks P/L via REST polling (1-2 second intervals)
+- **Position Monitoring**: Optional P/L tracking via REST polling (adaptive intervals)
 - **Hedged Pair P/L Tracking**: Calculates combined profit/loss for paired positions
+- **Rate Limit Aware**: Adaptive caching and polling based on account type (standard vs premium)
 
 ## How It Works
 
@@ -75,9 +76,13 @@ TELEGRAM_CHAT_ID=your_chat_id_or_group_id
 TELEGRAM_TOPIC_ID=  # Optional: for groups with topics
 TELEGRAM_ENABLE_NOTIFICATIONS=true
 
+# Account Type - IMPORTANT for rate limits!
+ACCOUNT_TYPE=standard  # or "premium"
+
 # Position Monitoring
-ENABLE_POSITION_MONITORING=true
-POSITION_MONITOR_INTERVAL=2.0  # seconds
+# WARNING: Uses many API calls! Disabled by default for standard accounts
+ENABLE_POSITION_MONITORING=false  # Set to "true" only if you understand rate limits
+POSITION_MONITOR_INTERVAL=90.0  # 90s for standard, 10s for premium
 ```
 
 ## Telegram Setup
@@ -138,13 +143,54 @@ Total Size: $50.00
 ⏰ 2025-11-18 20:30:45 UTC
 ```
 
+## API Rate Limits ⚠️
+
+**CRITICAL:** Lighter Protocol has strict API rate limits that vary by account type:
+
+| Account Type | Rate Limit | Safe Delay |
+|--------------|-----------|------------|
+| **Standard (Free)** | 10 requests/minute | 7 seconds |
+| **Premium** | 4000 requests/minute | 0.5 seconds |
+
+### Rate Limit Considerations
+
+**For Standard Accounts:**
+- Position monitoring is **DISABLED by default** (uses too many API calls)
+- If enabled, use minimum 90-second polling intervals
+- Market data cache: 120 seconds (2 minutes)
+- Price cache: 30 seconds
+- Expect slower operation but within rate limits
+
+**For Premium Accounts:**
+- Position monitoring **ENABLED by default**
+- Can use 10-second polling intervals safely
+- Market data cache: 30 seconds
+- Price cache: 5 seconds
+- Near real-time monitoring available
+
+**API Call Estimation:**
+
+Standard account budget: **10 calls/minute**
+- Position monitor (if enabled): 2-4 calls per cycle
+- Market data refresh: 1 call per token
+- Trading operations: 2-4 calls per position open/close
+
+With monitoring disabled and proper caching, standard accounts stay well within limits.
+
+### Configuring for Your Account Type
+
+Set `ACCOUNT_TYPE=premium` in `.env` if you have a premium account. This will automatically:
+- Enable position monitoring with optimal intervals
+- Use shorter cache TTLs for fresher data
+- Allow faster trading operations
+
 ## Position Monitoring
 
-The bot continuously monitors open positions via REST API polling (every 2 seconds by default):
+The bot can monitor open positions via REST API polling:
 
 - **Real-time P/L**: Tracks unrealized profit/loss
 - **Liquidation Risk**: Warns when price approaches liquidation
 - **Price Updates**: Fetches latest market prices
 - **Hedged Pair Tracking**: Calculates combined P/L for paired positions
 
-Since Lighter Protocol doesn't support WebSockets, the bot uses aggressive REST polling to achieve near-real-time monitoring.
+**Important:** Since Lighter Protocol doesn't support WebSockets, monitoring uses REST polling which consumes API rate limit. For standard accounts, this feature is disabled by default. Enable only if you understand the rate limit implications.

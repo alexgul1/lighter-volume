@@ -52,7 +52,7 @@ class PositionMonitor:
 
         # Price cache: {market_id: (price, timestamp)}
         self.price_cache: Dict[int, tuple[float, float]] = {}
-        self.price_cache_ttl = 1.0  # 1 second TTL
+        self.price_cache_ttl = Config.PRICE_CACHE_TTL  # Adaptive TTL based on account type
 
         # Monitoring state
         self.running = False

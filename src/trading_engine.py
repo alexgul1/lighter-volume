@@ -82,7 +82,7 @@ class TradingEngine:
         # Market data cache
         self.market_data_cache: Dict[str, MarketData] = {}  # token -> MarketData
         self.cache_timestamp = 0
-        self.cache_ttl = 30  # Cache market data for 30 seconds
+        self.cache_ttl = Config.MARKET_DATA_CACHE_TTL  # Adaptive caching based on account type
 
         # Track order indices per account
         self.next_order_index_1 = 1000
@@ -212,7 +212,8 @@ class TradingEngine:
                     )
                     logger.info(f"Set leverage {Config.DEFAULT_LEVERAGE}x for {token} on Account 1")
 
-                await asyncio.sleep(0.5)
+                # Respect rate limits between API calls
+                await asyncio.sleep(Config.SAFE_DELAY_BETWEEN_TRADES)
 
                 # Set leverage on Account 2
                 tx_info_2, error_2 = self.client_2.sign_update_leverage(
@@ -231,7 +232,8 @@ class TradingEngine:
                     )
                     logger.info(f"Set leverage {Config.DEFAULT_LEVERAGE}x for {token} on Account 2")
 
-                await asyncio.sleep(0.5)
+                # Respect rate limits between markets
+                await asyncio.sleep(Config.SAFE_DELAY_BETWEEN_TRADES)
 
             except Exception as e:
                 logger.error(f"Failed to set leverage for {token}: {e}")
@@ -296,13 +298,21 @@ class TradingEngine:
             return None
 
     async def get_all_market_data(self) -> Dict[str, MarketData]:
-        """Get market data for all trading tokens"""
+        """
+        Get market data for all trading tokens.
+        Uses rate-limit-friendly delays between requests.
+        """
         market_data = {}
-        for token in Config.TRADING_TOKENS:
+        for i, token in enumerate(Config.TRADING_TOKENS):
             data = await self.get_market_data(token, force_refresh=True)
             if data:
                 market_data[token] = data
-            await asyncio.sleep(0.1)  # Small delay between requests
+
+            # Add delay between requests (except after last one)
+            # Standard: 7s delay, Premium: 0.5s delay
+            if i < len(Config.TRADING_TOKENS) - 1:
+                await asyncio.sleep(Config.SAFE_DELAY_BETWEEN_TRADES)
+
         return market_data
 
     async def select_low_oi_tokens(self) -> List[str]:
