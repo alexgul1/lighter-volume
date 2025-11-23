@@ -617,13 +617,6 @@ class TradingEngine:
 
                     continue
 
-                # ⚠️ CRITICAL: Check if we already have open positions
-                # Only open ONE hedged pair at a time to avoid multiple simultaneous positions
-                if len(self.active_positions) > 0:
-                    logger.info(f"⏸️  Waiting - {len(self.active_positions)} positions already open")
-                    await asyncio.sleep(30)  # Check again in 30 seconds
-                    continue
-
                 # Select low OI tokens
                 available_tokens = await self.select_low_oi_tokens()
 
@@ -632,7 +625,16 @@ class TradingEngine:
                     await asyncio.sleep(Config.DELAY_BETWEEN_TRADES)
                     continue
 
-                # Select random token from low OI list
+                # ⚠️ CRITICAL: Filter out tokens that already have open positions
+                # Allow multiple pairs on DIFFERENT tokens, but only ONE pair per token
+                available_tokens = [t for t in available_tokens if t not in self.positions_by_token]
+
+                if not available_tokens:
+                    logger.info(f"⏸️  All low OI tokens already have open positions ({len(self.active_positions)} positions). Waiting...")
+                    await asyncio.sleep(30)  # Check again in 30 seconds
+                    continue
+
+                # Select random token from filtered list
                 token = random.choice(available_tokens)
 
                 # Open hedged position pair (long + short on different accounts)
