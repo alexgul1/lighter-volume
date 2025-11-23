@@ -16,6 +16,9 @@ Automated hedged futures trading bot for Lighter Protocol. Uses dual accounts to
 - **MongoDB Logging**: Complete audit trail of all positions
 - **Automatic Recovery**: Pauses and restarts on consecutive failures
 - **Telegram Notifications**: Real-time alerts for trades, positions, P/L, and errors
+- **Telegram Bot Commands**: Interactive commands (/balance, /pnl, /status, /help)
+- **Balance Monitoring**: Automatic balance checks after every position close
+- **Low Balance Alerts**: Warns when account balance < MAX_TRADE_AMOUNT × 3
 - **Position Monitoring**: Optional P/L tracking via REST polling (adaptive intervals)
 - **Hedged Pair P/L Tracking**: Calculates combined profit/loss for paired positions
 - **Rate Limit Aware**: Adaptive caching and polling based on account type (standard vs premium)
@@ -116,9 +119,34 @@ The bot sends notifications for:
 - **Hedged Pair Opened**: Both positions with full details
 - **Position Closed**: P/L, hold time, price change
 - **Hedged Pair Closed**: Combined P/L for both positions
+- **Account Balances**: Sent after every position close with current balances and P/L for both accounts
+- **Low Balance Alert**: Automatic warning when account balance < MAX_TRADE_AMOUNT × 3
 - **Errors**: Trading errors, API failures
 - **Restart Events**: Bot restarts and recovery
 - **Summary**: Periodic trading statistics
+
+### Telegram Bot Commands
+
+You can interact with the bot using these commands in Telegram:
+
+| Command | Description |
+|---------|-------------|
+| `/balance` | Show current account balances |
+| `/pnl` | Show profit & loss for both accounts |
+| `/status` | Full account status (balances, P/L, positions, uptime) |
+| `/help` | Show available commands |
+
+**Example:**
+Send `/balance` to the bot and it will reply with:
+```
+💰 Account Balances
+
+Account 1: $1,234.56
+Account 2: $987.65
+Total: $2,222.21
+
+⏰ 2025-11-18 21:00:00 UTC
+```
 
 ### Example Notification
 
