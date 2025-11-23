@@ -567,7 +567,9 @@ class TradingEngine:
         logger.info("🚀 Hedged futures trading bot started")
         logger.info(f"Strategy: Dual account long/short pairs")
         logger.info(f"Tokens: {Config.TRADING_TOKENS}")
-        logger.info(f"Position size: ${Config.MIN_TRADE_AMOUNT} - ${Config.MAX_TRADE_AMOUNT}")
+        logger.info(f"Leverage: {Config.DEFAULT_LEVERAGE}x")
+        logger.info(f"Margin per position: ${Config.MIN_TRADE_AMOUNT} - ${Config.MAX_TRADE_AMOUNT}")
+        logger.info(f"Position size: ${Config.MIN_TRADE_AMOUNT * Config.DEFAULT_LEVERAGE} - ${Config.MAX_TRADE_AMOUNT * Config.DEFAULT_LEVERAGE}")
         logger.info(f"Hold time: {Config.POSITION_HOLD_TIME_MIN/3600:.1f}h - {Config.POSITION_HOLD_TIME_MAX/3600:.1f}h")
         logger.info(f"Low OI filter: {'Enabled' if Config.ENABLE_LOW_OI_FILTER else 'Disabled'}")
 
@@ -656,19 +658,24 @@ class TradingEngine:
             logger.error(f"Cannot get market data for {token}")
             return
 
-        # Generate base USDC amount
-        base_usdc_amount = round(random.uniform(
+        # Generate base margin (not position size!)
+        # MIN_TRADE_AMOUNT and MAX_TRADE_AMOUNT now represent MARGIN
+        base_margin = round(random.uniform(
             Config.MIN_TRADE_AMOUNT,
             Config.MAX_TRADE_AMOUNT
         ), 2)
 
-        # Apply variance to create slightly different amounts for each position
+        # Apply variance to create slightly different margins for each position
         variance = random.uniform(
             -Config.TRADE_AMOUNT_VARIANCE_PERCENT / 100,
             Config.TRADE_AMOUNT_VARIANCE_PERCENT / 100
         )
-        amount_1 = round(base_usdc_amount * (1 + variance), 2)
-        amount_2 = round(base_usdc_amount * (1 - variance), 2)
+        margin_1 = round(base_margin * (1 + variance), 2)
+        margin_2 = round(base_margin * (1 - variance), 2)
+
+        # Calculate position sizes: Position Size = Margin × Leverage
+        position_size_1 = round(margin_1 * Config.DEFAULT_LEVERAGE, 2)
+        position_size_2 = round(margin_2 * Config.DEFAULT_LEVERAGE, 2)
 
         # Randomize which account opens long vs short
         if random.choice([True, False]):
@@ -681,14 +688,14 @@ class TradingEngine:
             position_2_is_long = True
 
         logger.info(f"🎯 Opening hedged pair for {token} (OI: ${market_data.open_interest:,.0f}, Price: ${market_data.last_trade_price:.2f})")
-        logger.info(f"   Account 1: {'LONG' if position_1_is_long else 'SHORT'} ${amount_1}")
-        logger.info(f"   Account 2: {'LONG' if position_2_is_long else 'SHORT'} ${amount_2}")
+        logger.info(f"   Account 1: {'LONG' if position_1_is_long else 'SHORT'} - Margin: ${margin_1}, Position: ${position_size_1}")
+        logger.info(f"   Account 2: {'LONG' if position_2_is_long else 'SHORT'} - Margin: ${margin_2}, Position: ${position_size_2}")
 
-        # Open first position
+        # Open first position (using position size, not margin)
         position_id_1 = await self._open_single_position(
             token=token,
             is_long=position_1_is_long,
-            amount_usdc=amount_1,
+            amount_usdc=position_size_1,
             account_num=1,
             market_data=market_data
         )
@@ -703,11 +710,11 @@ class TradingEngine:
         )
         await asyncio.sleep(delay)
 
-        # Open second position
+        # Open second position (using position size, not margin)
         position_id_2 = await self._open_single_position(
             token=token,
             is_long=position_2_is_long,
-            amount_usdc=amount_2,
+            amount_usdc=position_size_2,
             account_num=2,
             market_data=market_data
         )
@@ -734,15 +741,18 @@ class TradingEngine:
                     token=token,
                     position_1_id=position_id_1,
                     position_1_type="long" if position_1_is_long else "short",
-                    position_1_amount=amount_1,
+                    position_1_margin=margin_1,
+                    position_1_size=position_size_1,
                     position_1_account=1,
                     position_2_id=position_id_2,
                     position_2_type="long" if position_2_is_long else "short",
-                    position_2_amount=amount_2,
+                    position_2_margin=margin_2,
+                    position_2_size=position_size_2,
                     position_2_account=2,
                     entry_price=market_data.last_trade_price,
                     open_interest=market_data.open_interest,
-                    hold_time_seconds=hold_time
+                    hold_time_seconds=hold_time,
+                    leverage=Config.DEFAULT_LEVERAGE
                 )
 
         asyncio.create_task(self._schedule_close_position(position_id_1, hold_time))
