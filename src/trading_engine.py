@@ -121,11 +121,13 @@ class TradingEngine:
                 raise Exception(f"Account 1 client check failed: {err}")
 
             # Get initial nonce for Account 1
+            logger.info(f"🔍 Fetching initial nonce for Account 1 (index={Config.ACCOUNT_1_INDEX})")
             next_nonce_1 = await self.transaction_api.next_nonce(
                 account_index=Config.ACCOUNT_1_INDEX,
                 api_key_index=Config.ACCOUNT_1_API_KEY_INDEX
             )
             self.current_nonce_1 = next_nonce_1.nonce
+            logger.info(f"✅ Initial nonce for Account 1: {self.current_nonce_1}")
 
             # Initialize Account 2 (Secondary)
             self.client_2 = lighter.SignerClient(
@@ -141,11 +143,13 @@ class TradingEngine:
                 raise Exception(f"Account 2 client check failed: {err}")
 
             # Get initial nonce for Account 2
+            logger.info(f"🔍 Fetching initial nonce for Account 2 (index={Config.ACCOUNT_2_INDEX})")
             next_nonce_2 = await self.transaction_api.next_nonce(
                 account_index=Config.ACCOUNT_2_INDEX,
                 api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
             )
             self.current_nonce_2 = next_nonce_2.nonce
+            logger.info(f"✅ Initial nonce for Account 2: {self.current_nonce_2}")
 
             # Set leverage for all markets on both accounts
             await self._set_leverage_for_markets()
@@ -245,12 +249,16 @@ class TradingEngine:
 
         for attempt in range(max_retries):
             try:
-                # Fetch fresh nonce and sign leverage update
+                # Fetch fresh nonce for this attempt
+                nonce = await self.get_next_nonce(account_num=account_num)
+                logger.info(f"📝 Signing leverage update for {token} on Account {account_num} with nonce={nonce}")
+
+                # Sign leverage update
                 tx_info, error = client.sign_update_leverage(
                     market_index=market_index,
                     fraction=imf,
                     margin_mode=client.CROSS_MARGIN_MODE,
-                    nonce=await self.get_next_nonce(account_num=account_num)
+                    nonce=nonce
                 )
 
                 if error:
@@ -258,23 +266,24 @@ class TradingEngine:
                     return
 
                 # Send transaction
+                logger.info(f"📤 Sending leverage update transaction for {token} on Account {account_num}")
                 await self.transaction_api.send_tx(
                     tx_type=client.TX_TYPE_UPDATE_LEVERAGE,
                     tx_info=tx_info
                 )
 
-                logger.info(f"Set leverage {Config.DEFAULT_LEVERAGE}x for {token} on Account {account_num}")
+                logger.info(f"✅ Set leverage {Config.DEFAULT_LEVERAGE}x for {token} on Account {account_num}")
                 return  # Success
 
             except Exception as e:
                 error_str = str(e).lower()
                 if attempt < max_retries - 1:
-                    logger.warning(f"Error setting leverage for {token} on Account {account_num} (attempt {attempt + 1}/{max_retries}): {e}")
+                    logger.warning(f"⚠️ Error setting leverage for {token} on Account {account_num} (attempt {attempt + 1}/{max_retries}): {e}")
                     await asyncio.sleep(1.0)  # Wait before retry
                     continue
                 else:
                     # Final attempt failed
-                    logger.error(f"Failed to set leverage for {token} on Account {account_num} after {max_retries} attempts: {e}")
+                    logger.error(f"❌ Failed to set leverage for {token} on Account {account_num} after {max_retries} attempts: {e}")
                     return
 
     async def cleanup(self):
@@ -603,29 +612,33 @@ class TradingEngine:
         async with self._nonce_lock:
             try:
                 if account_num == 1:
+                    logger.info(f"🔍 Fetching fresh nonce for Account 1 (index={Config.ACCOUNT_1_INDEX}, api_key_index={Config.ACCOUNT_1_API_KEY_INDEX})")
                     next_nonce = await self.transaction_api.next_nonce(
                         account_index=Config.ACCOUNT_1_INDEX,
                         api_key_index=Config.ACCOUNT_1_API_KEY_INDEX
                     )
                     nonce = next_nonce.nonce
-                    logger.debug(f"Fetched fresh nonce for Account 1: {nonce}")
+                    logger.info(f"✅ Received nonce for Account 1: {nonce}")
                 else:
+                    logger.info(f"🔍 Fetching fresh nonce for Account 2 (index={Config.ACCOUNT_2_INDEX}, api_key_index={Config.ACCOUNT_2_API_KEY_INDEX})")
                     next_nonce = await self.transaction_api.next_nonce(
                         account_index=Config.ACCOUNT_2_INDEX,
                         api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
                     )
                     nonce = next_nonce.nonce
-                    logger.debug(f"Fetched fresh nonce for Account 2: {nonce}")
+                    logger.info(f"✅ Received nonce for Account 2: {nonce}")
                 return nonce
             except Exception as e:
-                logger.error(f"Failed to fetch nonce for Account {account_num}: {e}")
+                logger.error(f"❌ Failed to fetch nonce for Account {account_num}: {e}")
                 # Fallback to cached nonce if API call fails
                 if account_num == 1:
                     nonce = self.current_nonce_1
                     self.current_nonce_1 += 1
+                    logger.warning(f"⚠️ Using cached nonce for Account 1: {nonce}")
                 else:
                     nonce = self.current_nonce_2
                     self.current_nonce_2 += 1
+                    logger.warning(f"⚠️ Using cached nonce for Account 2: {nonce}")
                 return nonce
 
     async def full_restart(self):
