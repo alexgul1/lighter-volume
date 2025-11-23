@@ -11,7 +11,7 @@ from src.database import DatabaseManager, Transaction
 from src.utils import setup_logger, Stats
 from src.telegram_notifier import TelegramNotifier
 from src.position_monitor import PositionMonitor
-from src.patched_signer_client import PatchedSignerClient
+
 
 logger = setup_logger(__name__, Config.LOG_LEVEL)
 
@@ -60,8 +60,8 @@ class TradingEngine:
         self.db = db_manager
 
         # Dual account support
-        self.client_1: Optional[PatchedSignerClient] = None
-        self.client_2: Optional[PatchedSignerClient] = None
+        self.client_1: Optional[lighter.SignerClient] = None
+        self.client_2: Optional[lighter.SignerClient] = None
         self.api_client = None
         self.transaction_api = None
         self.order_api = None
@@ -136,7 +136,7 @@ class TradingEngine:
 
             # Initialize Account 1 (Primary)
             logger.info("🔧 Initializing Account 1 SignerClient...")
-            self.client_1 = PatchedSignerClient(
+            self.client_1 = lighter.SignerClient(
                 url=Config.BASE_URL,
                 private_key=Config.ACCOUNT_1_PRIVATE_KEY,
                 account_index=Config.ACCOUNT_1_INDEX,
@@ -159,7 +159,7 @@ class TradingEngine:
 
             # Initialize Account 2 (Secondary) with separate API client
             logger.info("🔧 Initializing Account 2 SignerClient...")
-            self.client_2 = PatchedSignerClient(
+            self.client_2 = lighter.SignerClient(
                 url=Config.BASE_URL,
                 private_key=Config.ACCOUNT_2_PRIVATE_KEY,
                 account_index=Config.ACCOUNT_2_INDEX,
