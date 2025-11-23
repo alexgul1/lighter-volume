@@ -253,17 +253,28 @@ class TelegramNotifier:
         position_2_amount: float,
         position_2_account: int,
         entry_price: float,
-        open_interest: float
+        open_interest: float,
+        hold_time_seconds: float
     ):
         """Notify when a hedged pair is opened"""
         total_size = position_1_amount + position_2_amount
+
+        # Convert hold time to human readable format
+        hold_time_minutes = hold_time_seconds / 60
+        hold_time_hours = hold_time_seconds / 3600
+
+        if hold_time_hours >= 1:
+            hold_time_str = f"{hold_time_hours:.1f}h"
+        else:
+            hold_time_str = f"{hold_time_minutes:.0f}m"
 
         message = (
             f"🎯 <b>Hedged Pair Opened</b>\n\n"
             f"<b>Token:</b> {token}\n"
             f"<b>Price:</b> ${entry_price:.4f}\n"
             f"<b>Open Interest:</b> ${open_interest:,.0f}\n"
-            f"<b>Total Size:</b> ${total_size:.2f}\n\n"
+            f"<b>Total Size:</b> ${total_size:.2f}\n"
+            f"<b>Will close in:</b> {hold_time_str}\n\n"
 
             f"📈 <b>Position 1 ({position_1_type.upper()}):</b>\n"
             f"  Account: {position_1_account}\n"

@@ -191,6 +191,21 @@ class AccountWorker:
             logger.error(f"Failed to close position on Account {self.account_num}: {e}")
             return False
 
+    async def cleanup(self):
+        """Cleanup resources before worker terminates"""
+        try:
+            # Close aiohttp sessions to prevent unclosed client session warnings
+            if self.transaction_api and hasattr(self.transaction_api, 'api_client'):
+                api_client = self.transaction_api.api_client
+                if hasattr(api_client, 'rest_client') and hasattr(api_client.rest_client, 'pool_manager'):
+                    # Close the connection pool
+                    if hasattr(api_client.rest_client.pool_manager, 'close'):
+                        await api_client.rest_client.pool_manager.close()
+
+            logger.debug(f"🧹 Cleaned up resources for Account {self.account_num} worker")
+        except Exception as e:
+            logger.warning(f"Error during cleanup for Account {self.account_num}: {e}")
+
 
 async def run_worker_command(account_num: int, config: Dict[str, Any],
                              command: str, params: Dict[str, Any]) -> Any:
@@ -211,7 +226,7 @@ async def run_worker_command(account_num: int, config: Dict[str, Any],
     if not await worker.initialize():
         return {'error': 'Failed to initialize worker'}
 
-    # Execute command
+    # Execute command with cleanup
     try:
         if command == 'set_leverage':
             result = await worker.set_leverage(
@@ -249,6 +264,10 @@ async def run_worker_command(account_num: int, config: Dict[str, Any],
     except Exception as e:
         logger.error(f"Error executing command {command}: {e}")
         return {'error': str(e)}
+
+    finally:
+        # Always cleanup resources before process terminates
+        await worker.cleanup()
 
 
 def worker_main(account_num: int, config: Dict[str, Any],
