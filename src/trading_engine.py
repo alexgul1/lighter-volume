@@ -617,6 +617,13 @@ class TradingEngine:
 
                     continue
 
+                # ⚠️ CRITICAL: Check if we already have open positions
+                # Only open ONE hedged pair at a time to avoid multiple simultaneous positions
+                if len(self.active_positions) > 0:
+                    logger.info(f"⏸️  Waiting - {len(self.active_positions)} positions already open")
+                    await asyncio.sleep(30)  # Check again in 30 seconds
+                    continue
+
                 # Select low OI tokens
                 available_tokens = await self.select_low_oi_tokens()
 
