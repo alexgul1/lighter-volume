@@ -9,6 +9,8 @@ import lighter
 from src.config import Config
 from src.database import DatabaseManager, Transaction
 from src.utils import setup_logger, Stats
+from src.telegram_notifier import TelegramNotifier
+from src.position_monitor import PositionMonitor
 
 logger = setup_logger(__name__, Config.LOG_LEVEL)
 
@@ -62,12 +64,20 @@ class TradingEngine:
         self.api_client = None
         self.transaction_api = None
         self.order_api = None
+        self.account_api = None
+
+        # Telegram notifications
+        self.telegram: Optional[TelegramNotifier] = None
+
+        # Position monitoring
+        self.position_monitor: Optional[PositionMonitor] = None
 
         # Trading state
         self.active_positions: Dict[str, Position] = {}  # position_id -> Position
         self.positions_by_token: Dict[str, List[str]] = {}  # token -> list of position_ids
         self.running = False
         self.stats = Stats()
+        self.start_time = time.time()
 
         # Market data cache
         self.market_data_cache: Dict[str, MarketData] = {}  # token -> MarketData
@@ -95,6 +105,7 @@ class TradingEngine:
             self.api_client = lighter.ApiClient(configuration)
             self.transaction_api = lighter.TransactionApi(self.api_client)
             self.order_api = lighter.OrderApi(self.api_client)
+            self.account_api = lighter.AccountApi(self.api_client)
 
             # Initialize Account 1 (Primary)
             self.client_1 = lighter.SignerClient(
@@ -138,6 +149,31 @@ class TradingEngine:
 
             # Set leverage for all markets on both accounts
             await self._set_leverage_for_markets()
+
+            # Initialize Telegram notifications
+            if Config.TELEGRAM_ENABLE_NOTIFICATIONS and Config.TELEGRAM_BOT_TOKEN:
+                self.telegram = TelegramNotifier(
+                    bot_token=Config.TELEGRAM_BOT_TOKEN,
+                    chat_id=Config.TELEGRAM_CHAT_ID,
+                    message_thread_id=int(Config.TELEGRAM_TOPIC_ID) if Config.TELEGRAM_TOPIC_ID else None
+                )
+                await self.telegram.initialize()
+                logger.info("Telegram notifications enabled")
+            else:
+                logger.warning("Telegram notifications disabled")
+
+            # Initialize Position Monitor
+            if Config.ENABLE_POSITION_MONITORING:
+                self.position_monitor = PositionMonitor(
+                    account_api=self.account_api,
+                    order_api=self.order_api,
+                    account_1_index=Config.ACCOUNT_1_INDEX,
+                    account_2_index=Config.ACCOUNT_2_INDEX
+                )
+                await self.position_monitor.start()
+                logger.info(f"Position monitoring enabled (interval: {Config.POSITION_MONITOR_INTERVAL}s)")
+            else:
+                logger.warning("Position monitoring disabled")
 
             logger.info(f"🎯 Hedged trading engine initialized")
             logger.info(f"Account 1: Index {Config.ACCOUNT_1_INDEX}")
@@ -202,6 +238,10 @@ class TradingEngine:
 
     async def cleanup(self):
         """Cleanup resources"""
+        if self.position_monitor:
+            await self.position_monitor.stop()
+        if self.telegram:
+            await self.telegram.cleanup()
         if self.client_1:
             await self.client_1.close()
         if self.client_2:
@@ -521,6 +561,22 @@ class TradingEngine:
             self.active_positions[position_id_2].paired_position_id = position_id_1
             logger.info(f"✅ Hedged pair opened: {position_id_1} <-> {position_id_2}")
 
+            # Send Telegram notification
+            if self.telegram:
+                await self.telegram.notify_hedged_pair_opened(
+                    token=token,
+                    position_1_id=position_id_1,
+                    position_1_type="long" if position_1_is_long else "short",
+                    position_1_amount=amount_1,
+                    position_1_account=1,
+                    position_2_id=position_id_2,
+                    position_2_type="long" if position_2_is_long else "short",
+                    position_2_amount=amount_2,
+                    position_2_account=2,
+                    entry_price=market_data.last_trade_price,
+                    open_interest=market_data.open_interest
+                )
+
         # Schedule closing for both positions (same hold time for the pair)
         hold_time = random.uniform(
             Config.POSITION_HOLD_TIME_MIN,
@@ -753,9 +809,42 @@ class TradingEngine:
             # Count remaining positions for this token
             remaining = len(self.positions_by_token.get(position.token, []))
 
+            # Calculate hold time
+            hold_time_hours = (time.time() - position.open_time) / 3600
+
+            # Get PnL from position monitor if available
+            pnl = None
+            if self.position_monitor:
+                snapshot = self.position_monitor.get_position_snapshot(
+                    position.account_num,
+                    Config.MARKET_INDICES.get(position.token)
+                )
+                if snapshot:
+                    pnl = snapshot.unrealized_pnl + snapshot.realized_pnl
+
             logger.info(f"✅ Closed {position.position_type} {position.token} on Account {position.account_num} "
                         f"(ID: {position_id}, Remaining: {remaining})")
             logger.info(self.stats.get_stats_string())
+
+            # Send Telegram notification for single position close
+            if self.telegram:
+                await self.telegram.notify_position_closed(
+                    position_id=position_id,
+                    token=position.token,
+                    position_type=position.position_type,
+                    account_num=position.account_num,
+                    amount_usdc=position.amount_usdc,
+                    entry_price=position.entry_price,
+                    hold_time_hours=hold_time_hours,
+                    pnl=pnl
+                )
+
+            # Check if this is part of a hedged pair and send pair notification
+            if position.paired_position_id:
+                paired_pos = self.active_positions.get(position.paired_position_id)
+                # If paired position was already closed, send hedged pair summary
+                if not paired_pos:
+                    await self._send_hedged_pair_summary(position, position_id)
 
         except Exception as e:
             logger.error(f"Failed to close position {position_id}: {e}")
@@ -774,3 +863,45 @@ class TradingEngine:
                 error=str(e)
             )
             await self.db.log_transaction(tx)
+
+    async def _send_hedged_pair_summary(self, position: Position, position_id: str):
+        """
+        Send hedged pair summary when both positions are closed.
+        This is called when the second position of a pair closes.
+        """
+        if not self.telegram or not position.paired_position_id:
+            return
+
+        try:
+            # Get market ID for this token
+            market_id = Config.MARKET_INDICES.get(position.token)
+            if not market_id:
+                return
+
+            # Try to get PnL from position monitor (historical data might be available)
+            pair_pnl = None
+            if self.position_monitor:
+                pair_pnl = self.position_monitor.get_hedged_pair_pnl(market_id)
+
+            # If we don't have monitor data, we can't calculate accurate pair PnL
+            # Just notify that pair is fully closed
+            if not pair_pnl:
+                logger.info(f"Hedged pair for {position.token} fully closed (IDs: {position_id} <-> {position.paired_position_id})")
+                return
+
+            pos1_pnl, pos2_pnl, total_pnl = pair_pnl
+            hold_time_hours = (time.time() - position.open_time) / 3600
+
+            await self.telegram.notify_hedged_pair_closed(
+                token=position.token,
+                position_1_id=position_id,
+                position_1_pnl=pos1_pnl,
+                position_2_id=position.paired_position_id,
+                position_2_pnl=pos2_pnl,
+                total_pnl=total_pnl,
+                entry_price=position.entry_price,
+                hold_time_hours=hold_time_hours
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to send hedged pair summary: {e}")

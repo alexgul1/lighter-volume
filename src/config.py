@@ -71,6 +71,16 @@ class Config:
     MAX_OPEN_INTEREST_THRESHOLD = float(os.getenv("MAX_OPEN_INTEREST_THRESHOLD", "1000000"))  # Max OI in USDC
     MIN_MARKETS_FOR_OI_FILTER = int(os.getenv("MIN_MARKETS_FOR_OI_FILTER", "2"))  # Require at least N markets
 
+    # Telegram Notifications
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+    TELEGRAM_TOPIC_ID = os.getenv("TELEGRAM_TOPIC_ID")  # Optional: for groups with topics
+    TELEGRAM_ENABLE_NOTIFICATIONS = os.getenv("TELEGRAM_ENABLE_NOTIFICATIONS", "true").lower() == "true"
+
+    # Position Monitoring (for real-time PnL tracking)
+    ENABLE_POSITION_MONITORING = os.getenv("ENABLE_POSITION_MONITORING", "true").lower() == "true"
+    POSITION_MONITOR_INTERVAL = float(os.getenv("POSITION_MONITOR_INTERVAL", "2.0"))  # seconds
+
     # Logging
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
