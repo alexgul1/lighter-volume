@@ -626,18 +626,28 @@ class TradingEngine:
 
     async def stop(self):
         """Stop trading bot and close all positions"""
+        logger.info("🛑 === STARTING SHUTDOWN SEQUENCE ===")
         self.running = False
 
         # Close all open positions on shutdown
         if self.active_positions:
-            logger.info(f"🛑 Shutdown: Closing {len(self.active_positions)} open positions...")
+            logger.info(f"🛑 Shutdown: Found {len(self.active_positions)} open positions")
+            logger.info(f"Positions: {list(self.active_positions.keys())}")
+
             close_tasks = []
             for position_id, position in list(self.active_positions.items()):
+                logger.info(f"Checking position {position_id}: is_closing={position.is_closing}")
                 if not position.is_closing:
+                    logger.info(f"✓ Adding position {position_id} to close queue")
                     close_tasks.append(self._close_position(position_id))
+                else:
+                    logger.info(f"⚠️ Skipping position {position_id} - already closing")
 
             if close_tasks:
-                logger.info(f"⏳ Waiting for {len(close_tasks)} positions to close (timeout: 120s)...")
+                logger.info(f"⏳ Created {len(close_tasks)} close tasks. Starting parallel close (timeout: 120s)...")
+                import time
+                start_time = time.time()
+
                 try:
                     # Give enough time for worker processes to complete (60s each + buffer)
                     results = await asyncio.wait_for(
@@ -645,19 +655,34 @@ class TradingEngine:
                         timeout=120
                     )
 
+                    elapsed = time.time() - start_time
+                    logger.info(f"⏱️ Close tasks completed in {elapsed:.2f}s")
+
                     # Log any errors
+                    success_count = 0
+                    error_count = 0
                     for i, result in enumerate(results):
                         if isinstance(result, Exception):
-                            logger.error(f"Error closing position: {result}")
+                            logger.error(f"❌ Error closing position #{i}: {result}")
+                            error_count += 1
+                        else:
+                            success_count += 1
 
-                    logger.info("✅ All positions closed successfully")
+                    logger.info(f"✅ Close results: {success_count} successful, {error_count} errors")
+                    logger.info(f"Remaining active positions: {len(self.active_positions)}")
+
                 except asyncio.TimeoutError:
-                    logger.error("❌ Timeout waiting for positions to close")
+                    elapsed = time.time() - start_time
+                    logger.error(f"❌ Timeout waiting for positions to close after {elapsed:.2f}s")
                     logger.warning(f"⚠️ {len([p for p in self.active_positions.values() if not p.is_closing])} positions may still be open")
+                    logger.warning(f"Still active: {list(self.active_positions.keys())}")
+            else:
+                logger.info("No positions need closing (all already marked as closing)")
         else:
             logger.info("No open positions to close")
 
-        logger.info("Trading bot stopped")
+        logger.info("🛑 === SHUTDOWN COMPLETE ===")
+        logger.info(f"Final active positions count: {len(self.active_positions)}")
         logger.info(self.stats.get_stats_string())
 
     async def _trading_loop(self):
@@ -940,17 +965,25 @@ class TradingEngine:
 
     async def _close_position(self, position_id: str):
         """Close a specific position by ID via isolated worker process"""
+        logger.info(f"🔄 _close_position() called for {position_id}")
 
         position = self.active_positions.get(position_id)
-        if not position or position.is_closing:
+        if not position:
+            logger.warning(f"⚠️ Position {position_id} not found in active_positions")
+            return
+
+        if position.is_closing:
+            logger.warning(f"⚠️ Position {position_id} already marked as closing")
             return
 
         # Mark as closing to prevent double closing
+        logger.info(f"✓ Marking position {position_id} as closing")
         position.is_closing = True
 
         # Get market index
         market_index = Config.MARKET_INDICES.get(position.token)
         if market_index is None:
+            logger.error(f"❌ No market index for token {position.token}")
             return
 
         # For closing: reverse the side's price
@@ -960,7 +993,7 @@ class TradingEngine:
             price = 999999999  # Buy at any price
 
         logger.info(f"📉 Closing {position.position_type.upper()} {position.token} on Account {position.account_num} "
-                    f"(ID: {position_id})")
+                    f"(ID: {position_id}, market_index={market_index}, price={price})")
 
         # Get current market data for exit price
         market_data = await self.get_market_data(position.token)
@@ -998,9 +1031,17 @@ class TradingEngine:
 
         # Get order index for tracking
         order_index = await self.get_next_order_index(position.account_num)
+        logger.info(f"✓ Got order index: {order_index}")
 
         # Close position via isolated worker process
         try:
+            logger.info(f"⏳ Calling account_manager.close_position() for {position_id}...")
+            logger.info(f"   Account: {position.account_num}, Token: {position.token}, Market: {market_index}")
+            logger.info(f"   Base amount: {position.base_amount}, Is long: {position.is_long}, Order index: {order_index}")
+
+            import time
+            call_start = time.time()
+
             success = await self.account_manager.close_position(
                 account_num=position.account_num,
                 token=position.token,
@@ -1011,10 +1052,15 @@ class TradingEngine:
                 order_index=order_index
             )
 
+            call_duration = time.time() - call_start
+            logger.info(f"⏱️ account_manager.close_position() returned after {call_duration:.2f}s: success={success}")
+
             if not success:
-                logger.error(f"Failed to close position {position_id}")
+                logger.error(f"❌ account_manager.close_position() returned False for {position_id}")
                 position.is_closing = False
                 return
+
+            logger.info(f"✓ Position {position_id} closed successfully via worker")
 
             # Success - log and cleanup
             # Log transaction
