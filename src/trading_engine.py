@@ -103,6 +103,22 @@ class TradingEngine:
             # Create separate API clients for each account to avoid shared state conflicts
             logger.info("🔧 Creating separate API clients for each account...")
 
+            # Verify account configuration (security check)
+            pk1_hash = Config.ACCOUNT_1_PRIVATE_KEY[:8] + "..." + Config.ACCOUNT_1_PRIVATE_KEY[-8:]
+            pk2_hash = Config.ACCOUNT_2_PRIVATE_KEY[:8] + "..." + Config.ACCOUNT_2_PRIVATE_KEY[-8:]
+            logger.info(f"🔑 Account 1: index={Config.ACCOUNT_1_INDEX}, api_key_index={Config.ACCOUNT_1_API_KEY_INDEX}, pk={pk1_hash}")
+            logger.info(f"🔑 Account 2: index={Config.ACCOUNT_2_INDEX}, api_key_index={Config.ACCOUNT_2_API_KEY_INDEX}, pk={pk2_hash}")
+
+            if Config.ACCOUNT_1_PRIVATE_KEY == Config.ACCOUNT_2_PRIVATE_KEY:
+                logger.error("❌ CRITICAL: Both accounts use the SAME private key! This will cause nonce conflicts!")
+                raise Exception("Both accounts cannot use the same private key")
+
+            if Config.ACCOUNT_1_INDEX == Config.ACCOUNT_2_INDEX and Config.ACCOUNT_1_API_KEY_INDEX == Config.ACCOUNT_2_API_KEY_INDEX:
+                logger.error("❌ CRITICAL: Both accounts have SAME index configuration! This will cause nonce conflicts!")
+                raise Exception("Accounts must have different index configurations")
+
+            logger.info("✅ Account configurations are valid (different keys/indices)")
+
             # Account 1 API clients
             configuration_1 = lighter.Configuration(Config.BASE_URL)
             self.api_client_1 = lighter.ApiClient(configuration_1)
@@ -163,8 +179,21 @@ class TradingEngine:
             self.current_nonce_2 = next_nonce_2.nonce
             logger.info(f"✅ Initial nonce for Account 2: {self.current_nonce_2}")
 
-            # Set leverage for all markets on both accounts (now only Account 1)
+            # Set leverage for all markets on both accounts
             await self._set_leverage_for_markets()
+
+            # Check nonces AFTER leverage setting to detect any unexpected consumption
+            logger.info("🔍 Verifying nonces after leverage setting...")
+            nonce_check_1 = await self.transaction_api_1.next_nonce(
+                account_index=Config.ACCOUNT_1_INDEX,
+                api_key_index=Config.ACCOUNT_1_API_KEY_INDEX
+            )
+            nonce_check_2 = await self.transaction_api_2.next_nonce(
+                account_index=Config.ACCOUNT_2_INDEX,
+                api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
+            )
+            logger.info(f"✅ Nonce after leverage - Account 1: {nonce_check_1.nonce}")
+            logger.info(f"✅ Nonce after leverage - Account 2: {nonce_check_2.nonce}")
 
             # Initialize Telegram notifications
             if Config.TELEGRAM_ENABLE_NOTIFICATIONS and Config.TELEGRAM_BOT_TOKEN:
