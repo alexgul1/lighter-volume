@@ -276,9 +276,15 @@ def worker_main(account_num: int, config: Dict[str, Any],
     Worker process main function
     Runs in isolated process with its own global singleton
     """
+    import signal
+
+    # Ignore SIGINT in worker process - let it complete naturally
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     try:
         # Run async command
         result = asyncio.run(run_worker_command(account_num, config, command, params))
         result_queue.put(result)
     except Exception as e:
+        logger.error(f"Worker process exception: {e}")
         result_queue.put({'error': str(e)})
