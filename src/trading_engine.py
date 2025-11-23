@@ -608,6 +608,8 @@ class TradingEngine:
         """
         Get next nonce for specified account by fetching fresh from API.
         This eliminates all synchronization issues by always using the server as source of truth.
+
+        IMPORTANT: The API returns the last USED nonce, so we must increment by 1 to get the next valid nonce.
         """
         async with self._nonce_lock:
             try:
@@ -617,16 +619,18 @@ class TradingEngine:
                         account_index=Config.ACCOUNT_1_INDEX,
                         api_key_index=Config.ACCOUNT_1_API_KEY_INDEX
                     )
-                    nonce = next_nonce.nonce
-                    logger.info(f"✅ Received nonce for Account 1: {nonce}")
+                    api_nonce = next_nonce.nonce
+                    nonce = api_nonce + 1  # API returns last used nonce, we need next one
+                    logger.info(f"✅ Received nonce for Account 1: {api_nonce}, using {nonce} (api_nonce + 1)")
                 else:
                     logger.info(f"🔍 Fetching fresh nonce for Account 2 (index={Config.ACCOUNT_2_INDEX}, api_key_index={Config.ACCOUNT_2_API_KEY_INDEX})")
                     next_nonce = await self.transaction_api.next_nonce(
                         account_index=Config.ACCOUNT_2_INDEX,
                         api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
                     )
-                    nonce = next_nonce.nonce
-                    logger.info(f"✅ Received nonce for Account 2: {nonce}")
+                    api_nonce = next_nonce.nonce
+                    nonce = api_nonce + 1  # API returns last used nonce, we need next one
+                    logger.info(f"✅ Received nonce for Account 2: {api_nonce}, using {nonce} (api_nonce + 1)")
                 return nonce
             except Exception as e:
                 logger.error(f"❌ Failed to fetch nonce for Account {account_num}: {e}")
