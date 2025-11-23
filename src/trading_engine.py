@@ -1125,8 +1125,11 @@ class TradingEngine:
             # Calculate hold time
             hold_time_hours = (time.time() - position.open_time) / 3600
 
+            # Format PnL string
+            pnl_str = f"${pnl:.2f}" if pnl is not None else "N/A"
+
             logger.info(f"✅ Closed {position.position_type} {position.token} on Account {position.account_num} "
-                        f"(ID: {position_id}, Remaining: {remaining}, PnL: ${pnl:.2f if pnl else 'N/A'})")
+                        f"(ID: {position_id}, Remaining: {remaining}, PnL: {pnl_str})")
             logger.info(self.stats.get_stats_string())
 
             # Send Telegram notification for single position close
