@@ -248,6 +248,12 @@ class TradingEngine:
             except Exception as e:
                 logger.error(f"Failed to set leverage for {token}: {e}")
 
+        # Sync nonces from API after all leverage updates
+        # This ensures nonces are accurate before trading starts
+        logger.info("Syncing nonces after leverage updates...")
+        await self.sync_nonce_from_api(1)
+        await self.sync_nonce_from_api(2)
+
     async def cleanup(self):
         """Cleanup resources"""
         if self.position_monitor:
@@ -577,6 +583,31 @@ class TradingEngine:
                 self.current_nonce_2 += 1
             return nonce
 
+    async def sync_nonce_from_api(self, account_num: int):
+        """
+        Synchronize nonce with API (fetch latest from server).
+        Use this when nonce gets out of sync.
+        """
+        try:
+            if account_num == 1:
+                next_nonce = await self.transaction_api.next_nonce(
+                    account_index=Config.ACCOUNT_1_INDEX,
+                    api_key_index=Config.ACCOUNT_1_API_KEY_INDEX
+                )
+                async with self._nonce_lock:
+                    self.current_nonce_1 = next_nonce.nonce
+                    logger.info(f"Synced nonce for Account 1: {self.current_nonce_1}")
+            else:
+                next_nonce = await self.transaction_api.next_nonce(
+                    account_index=Config.ACCOUNT_2_INDEX,
+                    api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
+                )
+                async with self._nonce_lock:
+                    self.current_nonce_2 = next_nonce.nonce
+                    logger.info(f"Synced nonce for Account 2: {self.current_nonce_2}")
+        except Exception as e:
+            logger.error(f"Failed to sync nonce for Account {account_num}: {e}")
+
     async def full_restart(self):
         """Perform full restart: close everything and reinitialize"""
         logger.info("🔄 Starting full bot restart...")
@@ -827,37 +858,57 @@ class TradingEngine:
         # Select the appropriate client
         client = self.client_1 if account_num == 1 else self.client_2
 
+        # Retry logic for nonce errors
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                # Get order index and nonce for this account
+                order_index = await self.get_next_order_index(account_num)
+                nonce = await self.get_next_nonce(account_num)
+
+                # Sign order
+                tx_info, error = client.sign_create_order(
+                    market_index=market_index,
+                    client_order_index=order_index,
+                    base_amount=base_amount,
+                    price=price,
+                    is_ask=is_ask,
+                    order_type=client.ORDER_TYPE_MARKET,
+                    time_in_force=client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+                    reduce_only=False,
+                    trigger_price=0,
+                    order_expiry=0,
+                    nonce=nonce
+                )
+
+                if error:
+                    logger.error(f"Failed to sign order on Account {account_num}: {error}")
+                    self.consecutive_failures += 1
+                    return None
+
+                # Send transaction
+                result = await self.transaction_api.send_tx(
+                    tx_type=client.TX_TYPE_CREATE_ORDER,
+                    tx_info=tx_info
+                )
+                # If successful, break out of retry loop
+                break
+
+            except Exception as e:
+                error_str = str(e).lower()
+                # Check if this is a nonce error
+                if "invalid nonce" in error_str or "nonce" in error_str:
+                    logger.warning(f"Nonce error on Account {account_num} (attempt {attempt + 1}/{max_retries}): {e}")
+                    if attempt < max_retries - 1:
+                        # Sync nonce from API and retry
+                        await self.sync_nonce_from_api(account_num)
+                        await asyncio.sleep(0.5)  # Small delay before retry
+                        continue
+                # Re-raise if not nonce error or last attempt
+                raise
+
+        # Success - log and create position
         try:
-            # Get order index and nonce for this account
-            order_index = await self.get_next_order_index(account_num)
-            nonce = await self.get_next_nonce(account_num)
-
-            # Sign order
-            tx_info, error = client.sign_create_order(
-                market_index=market_index,
-                client_order_index=order_index,
-                base_amount=base_amount,
-                price=price,
-                is_ask=is_ask,
-                order_type=client.ORDER_TYPE_MARKET,
-                time_in_force=client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
-                reduce_only=False,
-                trigger_price=0,
-                order_expiry=0,
-                nonce=nonce
-            )
-
-            if error:
-                logger.error(f"Failed to sign order on Account {account_num}: {error}")
-                self.consecutive_failures += 1
-                return None
-
-            # Send transaction
-            result = await self.transaction_api.send_tx(
-                tx_type=client.TX_TYPE_CREATE_ORDER,
-                tx_info=tx_info
-            )
-
             # Log transaction
             tx = Transaction(
                 tx_type="open",
@@ -952,40 +1003,60 @@ class TradingEngine:
         # Select the appropriate client
         client = self.client_1 if position.account_num == 1 else self.client_2
 
+        logger.info(f"📉 Closing {position.position_type.upper()} {position.token} on Account {position.account_num} "
+                    f"(ID: {position_id})")
+
+        # Retry logic for nonce errors
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                # Get order index and nonce for this account
+                order_index = await self.get_next_order_index(position.account_num)
+                nonce = await self.get_next_nonce(position.account_num)
+
+                # Sign order
+                tx_info, error = client.sign_create_order(
+                    market_index=market_index,
+                    client_order_index=order_index,
+                    base_amount=position.base_amount,
+                    price=price,
+                    is_ask=is_ask,
+                    order_type=client.ORDER_TYPE_MARKET,
+                    time_in_force=client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+                    reduce_only=True,  # True for closing position
+                    trigger_price=0,
+                    order_expiry=0,  # 0 for IOC
+                    nonce=nonce
+                )
+
+                if error:
+                    logger.error(f"Failed to sign close order: {error}")
+                    position.is_closing = False  # Reset flag on error
+                    return
+
+                # Send transaction
+                result = await self.transaction_api.send_tx(
+                    tx_type=client.TX_TYPE_CREATE_ORDER,
+                    tx_info=tx_info
+                )
+                # If successful, break out of retry loop
+                break
+
+            except Exception as e:
+                error_str = str(e).lower()
+                # Check if this is a nonce error
+                if "invalid nonce" in error_str or "nonce" in error_str:
+                    logger.warning(f"Nonce error closing position on Account {position.account_num} (attempt {attempt + 1}/{max_retries}): {e}")
+                    if attempt < max_retries - 1:
+                        # Sync nonce from API and retry
+                        await self.sync_nonce_from_api(position.account_num)
+                        await asyncio.sleep(0.5)  # Small delay before retry
+                        continue
+                # Re-raise if not nonce error or last attempt
+                raise
+
+        # Success - log and cleanup
         try:
-            logger.info(f"📉 Closing {position.position_type.upper()} {position.token} on Account {position.account_num} "
-                        f"(ID: {position_id})")
-
-            # Get order index and nonce for this account
-            order_index = await self.get_next_order_index(position.account_num)
-            nonce = await self.get_next_nonce(position.account_num)
-
-            # Sign order
-            tx_info, error = client.sign_create_order(
-                market_index=market_index,
-                client_order_index=order_index,
-                base_amount=position.base_amount,
-                price=price,
-                is_ask=is_ask,
-                order_type=client.ORDER_TYPE_MARKET,
-                time_in_force=client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
-                reduce_only=True,  # True for closing position
-                trigger_price=0,
-                order_expiry=0,  # 0 for IOC
-                nonce=nonce
-            )
-
-            if error:
-                logger.error(f"Failed to sign close order: {error}")
-                position.is_closing = False  # Reset flag on error
-                return
-
-            # Send transaction
-            result = await self.transaction_api.send_tx(
-                tx_type=client.TX_TYPE_CREATE_ORDER,
-                tx_info=tx_info
-            )
-
             # Log transaction
             tx = Transaction(
                 tx_type="close",
