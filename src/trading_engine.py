@@ -238,20 +238,32 @@ class TradingEngine:
             account_index = Config.ACCOUNT_1_INDEX if account_num == 1 else Config.ACCOUNT_2_INDEX
             response = await self.account_api.account(by="index", value=str(account_index))
 
-            if not response.data:
+            # Handle different response formats from lighter SDK
+            account_data = None
+            if hasattr(response, 'data') and response.data:
+                account_data = response.data[0]
+            elif hasattr(response, 'sub_accounts') and response.sub_accounts:
+                account_data = response.sub_accounts[0]
+            elif hasattr(response, '__getitem__'):
+                # Response is directly indexable
+                account_data = response[0]
+            else:
+                # Response itself is the account data
+                account_data = response
+
+            if not account_data:
                 return (0.0, 0.0)
 
-            account_data = response.data[0]
-
             # Get available balance (USDC)
-            available_balance = float(account_data.available_balance) if account_data.available_balance else 0.0
+            available_balance = float(account_data.available_balance) if hasattr(account_data, 'available_balance') and account_data.available_balance else 0.0
 
             # Calculate total PnL (unrealized + realized)
             total_pnl = 0.0
-            for position in account_data.positions:
-                unrealized_pnl = float(position.unrealized_pnl) if position.unrealized_pnl else 0.0
-                realized_pnl = float(position.realized_pnl) if position.realized_pnl else 0.0
-                total_pnl += unrealized_pnl + realized_pnl
+            if hasattr(account_data, 'positions'):
+                for position in account_data.positions:
+                    unrealized_pnl = float(position.unrealized_pnl) if position.unrealized_pnl else 0.0
+                    realized_pnl = float(position.realized_pnl) if position.realized_pnl else 0.0
+                    total_pnl += unrealized_pnl + realized_pnl
 
             return (available_balance, total_pnl)
 
@@ -265,10 +277,20 @@ class TradingEngine:
             account_index = Config.ACCOUNT_1_INDEX if account_num == 1 else Config.ACCOUNT_2_INDEX
             response = await self.account_api.account(by="index", value=str(account_index))
 
-            if not response.data:
+            # Handle different response formats from lighter SDK
+            account_data = None
+            if hasattr(response, 'data') and response.data:
+                account_data = response.data[0]
+            elif hasattr(response, 'sub_accounts') and response.sub_accounts:
+                account_data = response.sub_accounts[0]
+            elif hasattr(response, '__getitem__'):
+                account_data = response[0]
+            else:
+                account_data = response
+
+            if not account_data or not hasattr(account_data, 'positions'):
                 return 0
 
-            account_data = response.data[0]
             count = sum(1 for pos in account_data.positions if float(pos.position) != 0)
             return count
 
@@ -435,11 +457,17 @@ class TradingEngine:
 
             detail = details_response.order_book_details[0]
 
+            # Convert open interest to USDC value
+            # OI comes in base units of the token, need to convert to USDC
+            # OI in USDC = (oi_base_units / 10^size_decimals) * price
+            oi_in_tokens = detail.open_interest / (10 ** detail.size_decimals)
+            oi_in_usdc = oi_in_tokens * detail.last_trade_price
+
             market_data = MarketData(
                 symbol=detail.symbol,
                 market_id=detail.market_id,
                 last_trade_price=detail.last_trade_price,
-                open_interest=detail.open_interest,
+                open_interest=oi_in_usdc,
                 size_decimals=detail.size_decimals,
                 price_decimals=detail.price_decimals
             )
