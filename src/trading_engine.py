@@ -472,38 +472,6 @@ class TradingEngine:
 
         return market_data
 
-    async def select_low_oi_tokens(self) -> List[str]:
-        """
-        Select tokens with low open interest for better farming rewards.
-        Returns list of token symbols sorted by OI (lowest first).
-        """
-        if not Config.ENABLE_LOW_OI_FILTER:
-            return Config.TRADING_TOKENS
-
-        market_data = await self.get_all_market_data()
-
-        # Filter and sort by open interest
-        low_oi_tokens = []
-        for token, data in market_data.items():
-            if data.open_interest <= Config.MAX_OPEN_INTEREST_THRESHOLD:
-                low_oi_tokens.append((token, data.open_interest))
-
-        # Sort by OI (lowest first)
-        low_oi_tokens.sort(key=lambda x: x[1])
-
-        # Extract token symbols
-        selected_tokens = [token for token, _ in low_oi_tokens]
-
-        # If we don't have enough tokens, add remaining ones
-        if len(selected_tokens) < Config.MIN_MARKETS_FOR_OI_FILTER:
-            remaining = [t for t in Config.TRADING_TOKENS if t not in selected_tokens]
-            selected_tokens.extend(remaining)
-
-        if selected_tokens:
-            oi_info = ", ".join([f"{t}: ${market_data[t].open_interest:,.0f}" for t in selected_tokens[:3]])
-            logger.info(f"📊 Selected low OI tokens: {oi_info}")
-
-        return selected_tokens if selected_tokens else Config.TRADING_TOKENS
 
     def calculate_base_amount(self, usdc_amount: float, current_price: float, size_decimals: int) -> int:
         """
@@ -578,18 +546,27 @@ class TradingEngine:
         await self._trading_loop()
 
     async def stop(self):
-        """Stop trading bot"""
+        """Stop trading bot and close all positions"""
         self.running = False
 
-        # Close all open positions
+        # Close all open positions on shutdown
         if self.active_positions:
-            logger.info(f"Closing {len(self.active_positions)} open positions...")
+            logger.info(f"🛑 Shutdown: Closing {len(self.active_positions)} open positions...")
             close_tasks = []
-            for position_id, position in self.active_positions.items():
+            for position_id, position in list(self.active_positions.items()):
                 if not position.is_closing:
                     close_tasks.append(self._close_position(position_id))
+
             if close_tasks:
-                await asyncio.gather(*close_tasks, return_exceptions=True)
+                logger.info(f"⏳ Waiting for {len(close_tasks)} positions to close...")
+                results = await asyncio.gather(*close_tasks, return_exceptions=True)
+
+                # Log any errors
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        logger.error(f"Error closing position: {result}")
+
+                logger.info("✅ All positions closed")
 
         logger.info("Trading bot stopped")
         logger.info(self.stats.get_stats_string())
@@ -617,20 +594,13 @@ class TradingEngine:
 
                     continue
 
-                # Select low OI tokens
-                available_tokens = await self.select_low_oi_tokens()
-
-                if not available_tokens:
-                    logger.warning("No tokens available for trading")
-                    await asyncio.sleep(Config.DELAY_BETWEEN_TRADES)
-                    continue
-
+                # Use tokens from config (no OI filtering)
                 # ⚠️ CRITICAL: Filter out tokens that already have open positions
                 # Allow multiple pairs on DIFFERENT tokens, but only ONE pair per token
-                available_tokens = [t for t in available_tokens if t not in self.positions_by_token]
+                available_tokens = [t for t in Config.TRADING_TOKENS if t not in self.positions_by_token]
 
                 if not available_tokens:
-                    logger.info(f"⏸️  All low OI tokens already have open positions ({len(self.active_positions)} positions). Waiting...")
+                    logger.info(f"⏸️  All tokens already have open positions ({len(self.active_positions)} positions). Waiting...")
                     await asyncio.sleep(30)  # Check again in 30 seconds
                     continue
 
@@ -718,13 +688,19 @@ class TradingEngine:
             logger.warning(f"Failed to open second position of hedged pair")
             return
 
+        # Schedule closing for both positions (same hold time for the pair)
+        hold_time = random.uniform(
+            Config.POSITION_HOLD_TIME_MIN,
+            Config.POSITION_HOLD_TIME_MAX
+        )
+
         # Link the paired positions
         if position_id_1 in self.active_positions and position_id_2 in self.active_positions:
             self.active_positions[position_id_1].paired_position_id = position_id_2
             self.active_positions[position_id_2].paired_position_id = position_id_1
             logger.info(f"✅ Hedged pair opened: {position_id_1} <-> {position_id_2}")
 
-            # Send Telegram notification
+            # Send Telegram notification with hold time
             if self.telegram:
                 await self.telegram.notify_hedged_pair_opened(
                     token=token,
@@ -737,14 +713,10 @@ class TradingEngine:
                     position_2_amount=amount_2,
                     position_2_account=2,
                     entry_price=market_data.last_trade_price,
-                    open_interest=market_data.open_interest
+                    open_interest=market_data.open_interest,
+                    hold_time_seconds=hold_time
                 )
 
-        # Schedule closing for both positions (same hold time for the pair)
-        hold_time = random.uniform(
-            Config.POSITION_HOLD_TIME_MIN,
-            Config.POSITION_HOLD_TIME_MAX
-        )
         asyncio.create_task(self._schedule_close_position(position_id_1, hold_time))
         asyncio.create_task(self._schedule_close_position(position_id_2, hold_time))
 

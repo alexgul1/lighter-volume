@@ -19,9 +19,14 @@ async def main():
     try:
         await bot.run()
     except KeyboardInterrupt:
-        logger.info("Interrupted by user")
+        logger.info("🛑 Interrupted by user - shutting down gracefully...")
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        logger.error(f"❌ Fatal error: {e}")
+        logger.info("Attempting graceful shutdown...")
+        try:
+            await bot.stop()
+        except:
+            pass
         sys.exit(1)
 
 
