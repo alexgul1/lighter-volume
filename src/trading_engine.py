@@ -11,7 +11,7 @@ from src.database import DatabaseManager, Transaction
 from src.utils import setup_logger, Stats
 from src.telegram_notifier import TelegramNotifier
 from src.position_monitor import PositionMonitor
-
+from src.account_manager import AccountManager
 
 logger = setup_logger(__name__, Config.LOG_LEVEL)
 
@@ -59,11 +59,11 @@ class TradingEngine:
     def __init__(self, db_manager: DatabaseManager):
         self.db = db_manager
 
-        # Dual account support
-        self.client_1: Optional[lighter.SignerClient] = None
-        self.client_2: Optional[lighter.SignerClient] = None
+        # Account manager for isolated worker processes
+        self.account_manager: Optional[AccountManager] = None
+
+        # Shared API clients for read operations
         self.api_client = None
-        self.transaction_api = None
         self.order_api = None
         self.account_api = None
 
@@ -85,24 +85,18 @@ class TradingEngine:
         self.cache_timestamp = 0
         self.cache_ttl = Config.MARKET_DATA_CACHE_TTL  # Adaptive caching based on account type
 
-        # Track order indices per account
+        # Track order indices per account (for worker processes)
         self.next_order_index_1 = 1000
         self.next_order_index_2 = 2000
         self._order_index_lock = asyncio.Lock()
-
-        # Track nonces per account
-        self.current_nonce_1 = 0
-        self.current_nonce_2 = 0
-        self._nonce_lock = asyncio.Lock()
 
         # Error tracking for automatic recovery
         self.consecutive_failures = 0
 
     async def initialize(self):
-        """Initialize Lighter clients for dual account hedging"""
+        """Initialize Lighter clients for dual account hedging with process isolation"""
         try:
-            # Create separate API clients for each account to avoid shared state conflicts
-            logger.info("🔧 Creating separate API clients for each account...")
+            logger.info("🔧 Initializing Account Manager with isolated worker processes...")
 
             # Verify account configuration (security check)
             pk1_hash = Config.ACCOUNT_1_PRIVATE_KEY[:8] + "..." + Config.ACCOUNT_1_PRIVATE_KEY[-8:]
@@ -120,81 +114,18 @@ class TradingEngine:
 
             logger.info("✅ Account configurations are valid (different keys/indices)")
 
-            # Account 1 API clients
-            configuration_1 = lighter.Configuration(Config.BASE_URL)
-            self.api_client_1 = lighter.ApiClient(configuration_1)
-            self.transaction_api_1 = lighter.TransactionApi(self.api_client_1)
-
-            # Account 2 API clients
-            configuration_2 = lighter.Configuration(Config.BASE_URL)
-            self.api_client_2 = lighter.ApiClient(configuration_2)
-            self.transaction_api_2 = lighter.TransactionApi(self.api_client_2)
+            # Initialize Account Manager (handles process isolation)
+            self.account_manager = AccountManager()
+            logger.info("✅ Account Manager initialized with multiprocessing isolation")
 
             # Shared API clients for read operations (order, account)
-            self.order_api = lighter.OrderApi(self.api_client_1)
-            self.account_api = lighter.AccountApi(self.api_client_1)
-
-            # Initialize Account 1 (Primary)
-            logger.info("🔧 Initializing Account 1 SignerClient...")
-            self.client_1 = lighter.SignerClient(
-                url=Config.BASE_URL,
-                private_key=Config.ACCOUNT_1_PRIVATE_KEY,
-                account_index=Config.ACCOUNT_1_INDEX,
-                api_key_index=Config.ACCOUNT_1_API_KEY_INDEX
-            )
-
-            # Check Account 1
-            err = self.client_1.check_client()
-            if err is not None:
-                raise Exception(f"Account 1 client check failed: {err}")
-
-            # Get initial nonce for Account 1
-            logger.info(f"🔍 Fetching initial nonce for Account 1 (index={Config.ACCOUNT_1_INDEX})")
-            next_nonce_1 = await self.transaction_api_1.next_nonce(
-                account_index=Config.ACCOUNT_1_INDEX,
-                api_key_index=Config.ACCOUNT_1_API_KEY_INDEX
-            )
-            self.current_nonce_1 = next_nonce_1.nonce
-            logger.info(f"✅ Initial nonce for Account 1: {self.current_nonce_1}")
-
-            # Initialize Account 2 (Secondary) with separate API client
-            logger.info("🔧 Initializing Account 2 SignerClient...")
-            self.client_2 = lighter.SignerClient(
-                url=Config.BASE_URL,
-                private_key=Config.ACCOUNT_2_PRIVATE_KEY,
-                account_index=Config.ACCOUNT_2_INDEX,
-                api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
-            )
-
-            # Check Account 2
-            err = self.client_2.check_client()
-            if err is not None:
-                raise Exception(f"Account 2 client check failed: {err}")
-
-            # Get initial nonce for Account 2 using its own API client
-            logger.info(f"🔍 Fetching initial nonce for Account 2 (index={Config.ACCOUNT_2_INDEX})")
-            next_nonce_2 = await self.transaction_api_2.next_nonce(
-                account_index=Config.ACCOUNT_2_INDEX,
-                api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
-            )
-            self.current_nonce_2 = next_nonce_2.nonce
-            logger.info(f"✅ Initial nonce for Account 2: {self.current_nonce_2}")
+            configuration = lighter.Configuration(Config.BASE_URL)
+            self.api_client = lighter.ApiClient(configuration)
+            self.order_api = lighter.OrderApi(self.api_client)
+            self.account_api = lighter.AccountApi(self.api_client)
 
             # Set leverage for all markets on both accounts
             await self._set_leverage_for_markets()
-
-            # Check nonces AFTER leverage setting to detect any unexpected consumption
-            logger.info("🔍 Verifying nonces after leverage setting...")
-            nonce_check_1 = await self.transaction_api_1.next_nonce(
-                account_index=Config.ACCOUNT_1_INDEX,
-                api_key_index=Config.ACCOUNT_1_API_KEY_INDEX
-            )
-            nonce_check_2 = await self.transaction_api_2.next_nonce(
-                account_index=Config.ACCOUNT_2_INDEX,
-                api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
-            )
-            logger.info(f"✅ Nonce after leverage - Account 1: {nonce_check_1.nonce}")
-            logger.info(f"✅ Nonce after leverage - Account 2: {nonce_check_2.nonce}")
 
             # Initialize Telegram notifications
             if Config.TELEGRAM_ENABLE_NOTIFICATIONS and Config.TELEGRAM_BOT_TOKEN:
@@ -242,9 +173,7 @@ class TradingEngine:
             raise
 
     async def _set_leverage_for_markets(self):
-        """Set leverage for all trading markets on both accounts"""
-        imf = int(10000 / Config.DEFAULT_LEVERAGE)
-
+        """Set leverage for all trading markets on both accounts via worker processes"""
         logger.info("Setting leverage for all trading markets on both accounts...")
 
         for token in Config.TRADING_TOKENS:
@@ -252,82 +181,39 @@ class TradingEngine:
             if market_index is None:
                 continue
 
-            # Set leverage on Account 1 with retry logic
-            await self._set_leverage_with_retry(
+            # Set leverage on Account 1 via worker process
+            success_1 = await self.account_manager.set_leverage(
                 account_num=1,
-                client=self.client_1,
                 token=token,
                 market_index=market_index,
-                imf=imf
+                leverage=Config.DEFAULT_LEVERAGE
             )
+
+            if success_1:
+                logger.info(f"✅ Set leverage {Config.DEFAULT_LEVERAGE}x for {token} on Account 1")
+            else:
+                logger.error(f"❌ Failed to set leverage for {token} on Account 1")
 
             # Respect rate limits between API calls
             await asyncio.sleep(Config.SAFE_DELAY_BETWEEN_TRADES)
 
-            # Set leverage on Account 2 with retry logic
-            await self._set_leverage_with_retry(
+            # Set leverage on Account 2 via worker process
+            success_2 = await self.account_manager.set_leverage(
                 account_num=2,
-                client=self.client_2,
                 token=token,
                 market_index=market_index,
-                imf=imf
+                leverage=Config.DEFAULT_LEVERAGE
             )
+
+            if success_2:
+                logger.info(f"✅ Set leverage {Config.DEFAULT_LEVERAGE}x for {token} on Account 2")
+            else:
+                logger.error(f"❌ Failed to set leverage for {token} on Account 2")
 
             # Respect rate limits between markets
             await asyncio.sleep(Config.SAFE_DELAY_BETWEEN_TRADES)
 
         logger.info("✅ Leverage updates completed for all markets")
-
-    async def _set_leverage_with_retry(
-        self,
-        account_num: int,
-        client: lighter.SignerClient,
-        token: str,
-        market_index: int,
-        imf: int
-    ):
-        """Set leverage for a single market with retry logic for transient errors"""
-        max_retries = 3
-
-        for attempt in range(max_retries):
-            try:
-                # Fetch fresh nonce for this attempt
-                nonce = await self.get_next_nonce(account_num=account_num)
-                logger.info(f"📝 Signing leverage update for {token} on Account {account_num} with nonce={nonce}")
-
-                # Sign leverage update
-                tx_info, error = client.sign_update_leverage(
-                    market_index=market_index,
-                    fraction=imf,
-                    margin_mode=client.CROSS_MARGIN_MODE,
-                    nonce=nonce
-                )
-
-                if error:
-                    logger.error(f"Failed to sign leverage update for {token} on Account {account_num}: {error}")
-                    return
-
-                # Send transaction using account-specific transaction API
-                logger.info(f"📤 Sending leverage update transaction for {token} on Account {account_num}")
-                transaction_api = self.transaction_api_1 if account_num == 1 else self.transaction_api_2
-                await transaction_api.send_tx(
-                    tx_type=client.TX_TYPE_UPDATE_LEVERAGE,
-                    tx_info=tx_info
-                )
-
-                logger.info(f"✅ Set leverage {Config.DEFAULT_LEVERAGE}x for {token} on Account {account_num}")
-                return  # Success
-
-            except Exception as e:
-                error_str = str(e).lower()
-                if attempt < max_retries - 1:
-                    logger.warning(f"⚠️ Error setting leverage for {token} on Account {account_num} (attempt {attempt + 1}/{max_retries}): {e}")
-                    await asyncio.sleep(1.0)  # Wait before retry
-                    continue
-                else:
-                    # Final attempt failed
-                    logger.error(f"❌ Failed to set leverage for {token} on Account {account_num} after {max_retries} attempts: {e}")
-                    return
 
     async def cleanup(self):
         """Cleanup resources"""
@@ -335,14 +221,8 @@ class TradingEngine:
             await self.position_monitor.stop()
         if self.telegram:
             await self.telegram.cleanup()
-        if self.client_1:
-            await self.client_1.close()
-        if self.client_2:
-            await self.client_2.close()
-        if hasattr(self, 'api_client_1') and self.api_client_1:
-            await self.api_client_1.close()
-        if hasattr(self, 'api_client_2') and self.api_client_2:
-            await self.api_client_2.close()
+        if self.api_client:
+            await self.api_client.close()
 
     async def get_account_balance(self, account_num: int) -> Tuple[float, float]:
         """
@@ -356,29 +236,15 @@ class TradingEngine:
         """
         try:
             account_index = Config.ACCOUNT_1_INDEX if account_num == 1 else Config.ACCOUNT_2_INDEX
-            logger.info(f"🔍 Fetching balance for Account {account_num} (index={account_index})")
-
             response = await self.account_api.account(by="index", value=str(account_index))
 
-            logger.info(f"📊 Account API response for Account {account_num}:")
-            logger.info(f"  - response: {response}")
-            logger.info(f"  - response.data: {response.data if hasattr(response, 'data') else 'NO DATA ATTR'}")
-            logger.info(f"  - response type: {type(response)}")
-            logger.info(f"  - response dir: {[attr for attr in dir(response) if not attr.startswith('_')]}")
-
             if not response.data:
-                logger.warning(f"⚠️ No data in response for Account {account_num}")
                 return (0.0, 0.0)
 
             account_data = response.data[0]
-            logger.info(f"📊 Account data for Account {account_num}:")
-            logger.info(f"  - account_data: {account_data}")
-            logger.info(f"  - type: {type(account_data)}")
-            logger.info(f"  - dir: {[attr for attr in dir(account_data) if not attr.startswith('_')]}")
 
             # Get available balance (USDC)
             available_balance = float(account_data.available_balance) if account_data.available_balance else 0.0
-            logger.info(f"💰 Available balance for Account {account_num}: {available_balance}")
 
             # Calculate total PnL (unrealized + realized)
             total_pnl = 0.0
@@ -387,12 +253,10 @@ class TradingEngine:
                 realized_pnl = float(position.realized_pnl) if position.realized_pnl else 0.0
                 total_pnl += unrealized_pnl + realized_pnl
 
-            logger.info(f"📈 Total PnL for Account {account_num}: {total_pnl}")
             return (available_balance, total_pnl)
 
         except Exception as e:
-            logger.error(f"❌ Failed to get account {account_num} balance: {e}")
-            logger.exception(e)
+            logger.error(f"Failed to get account {account_num} balance: {e}")
             return (0.0, 0.0)
 
     async def get_account_position_count(self, account_num: int) -> int:
@@ -665,43 +529,6 @@ class TradingEngine:
                 self.next_order_index_2 += 1
             return index
 
-    async def get_next_nonce(self, account_num: int) -> int:
-        """
-        Get next nonce for specified account by fetching fresh from API.
-        Uses separate transaction_api for each account to avoid shared state conflicts.
-        """
-        async with self._nonce_lock:
-            try:
-                if account_num == 1:
-                    logger.info(f"🔍 Fetching fresh nonce for Account 1 (index={Config.ACCOUNT_1_INDEX}, api_key_index={Config.ACCOUNT_1_API_KEY_INDEX})")
-                    next_nonce = await self.transaction_api_1.next_nonce(
-                        account_index=Config.ACCOUNT_1_INDEX,
-                        api_key_index=Config.ACCOUNT_1_API_KEY_INDEX
-                    )
-                    nonce = next_nonce.nonce
-                    logger.info(f"✅ Received nonce for Account 1: {nonce}")
-                else:
-                    logger.info(f"🔍 Fetching fresh nonce for Account 2 (index={Config.ACCOUNT_2_INDEX}, api_key_index={Config.ACCOUNT_2_API_KEY_INDEX})")
-                    next_nonce = await self.transaction_api_2.next_nonce(
-                        account_index=Config.ACCOUNT_2_INDEX,
-                        api_key_index=Config.ACCOUNT_2_API_KEY_INDEX
-                    )
-                    nonce = next_nonce.nonce
-                    logger.info(f"✅ Received nonce for Account 2: {nonce}")
-                return nonce
-            except Exception as e:
-                logger.error(f"❌ Failed to fetch nonce for Account {account_num}: {e}")
-                # Fallback to cached nonce if API call fails
-                if account_num == 1:
-                    nonce = self.current_nonce_1
-                    self.current_nonce_1 += 1
-                    logger.warning(f"⚠️ Using cached nonce for Account 1: {nonce}")
-                else:
-                    nonce = self.current_nonce_2
-                    self.current_nonce_2 += 1
-                    logger.warning(f"⚠️ Using cached nonce for Account 2: {nonce}")
-                return nonce
-
     async def full_restart(self):
         """Perform full restart: close everything and reinitialize"""
         logger.info("🔄 Starting full bot restart...")
@@ -728,10 +555,8 @@ class TradingEngine:
         self.positions_by_token.clear()
         self.market_data_cache.clear()
         self.consecutive_failures = 0
-        self.client_1 = None
-        self.client_2 = None
+        self.account_manager = None
         self.api_client = None
-        self.transaction_api = None
         self.order_api = None
 
         # Reinitialize everything
@@ -923,7 +748,7 @@ class TradingEngine:
         market_data: MarketData
     ) -> Optional[str]:
         """
-        Open a single position on specified account with proper price calculation.
+        Open a single position on specified account via isolated worker process.
         Returns position_id if successful, None otherwise.
         """
         market_index = market_data.market_id
@@ -944,62 +769,30 @@ class TradingEngine:
         # Market order prices
         if is_long:
             price = 999999999  # Buy at any price
-            is_ask = False  # Buy to open long
         else:
             price = 1  # Sell at any price
-            is_ask = True  # Sell to open short
 
-        # Select the appropriate client
-        client = self.client_1 if account_num == 1 else self.client_2
+        # Get order index for tracking
+        order_index = await self.get_next_order_index(account_num)
 
-        # Retry logic for transient errors
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                # Get order index and fresh nonce for this account
-                order_index = await self.get_next_order_index(account_num)
-                nonce = await self.get_next_nonce(account_num)
-
-                # Sign order
-                tx_info, error = client.sign_create_order(
-                    market_index=market_index,
-                    client_order_index=order_index,
-                    base_amount=base_amount,
-                    price=price,
-                    is_ask=is_ask,
-                    order_type=client.ORDER_TYPE_MARKET,
-                    time_in_force=client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
-                    reduce_only=False,
-                    trigger_price=0,
-                    order_expiry=0,
-                    nonce=nonce
-                )
-
-                if error:
-                    logger.error(f"Failed to sign order on Account {account_num}: {error}")
-                    self.consecutive_failures += 1
-                    return None
-
-                # Send transaction using account-specific transaction API
-                transaction_api = self.transaction_api_1 if account_num == 1 else self.transaction_api_2
-                result = await transaction_api.send_tx(
-                    tx_type=client.TX_TYPE_CREATE_ORDER,
-                    tx_info=tx_info
-                )
-                # If successful, break out of retry loop
-                break
-
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    logger.warning(f"Error opening position on Account {account_num} (attempt {attempt + 1}/{max_retries}): {e}")
-                    await asyncio.sleep(1.0)  # Wait before retry
-                    continue
-                # Re-raise on final attempt
-                raise
-
-        # Success - log and create position
+        # Open position via isolated worker process
         try:
-            # Log transaction
+            result = await self.account_manager.open_position(
+                account_num=account_num,
+                token=token,
+                market_index=market_index,
+                base_amount=base_amount,
+                is_long=is_long,
+                price=price,
+                order_index=order_index
+            )
+
+            if not result or not result.get('success'):
+                logger.error(f"Failed to open position on Account {account_num}: {result}")
+                self.consecutive_failures += 1
+                return None
+
+            # Success - log and create position
             tx = Transaction(
                 tx_type="open",
                 position_type=position_type,
@@ -1009,7 +802,7 @@ class TradingEngine:
                 price=market_data.last_trade_price,
                 is_success=True,
                 order_id=f"Acc{account_num}_{order_index}",
-                tx_hash=str(result) if result else None
+                tx_hash=result.get('result')
             )
             open_tx_id = await self.db.log_transaction(tx)
 
@@ -1068,7 +861,7 @@ class TradingEngine:
         await self._close_position(position_id)
 
     async def _close_position(self, position_id: str):
-        """Close a specific position by ID (supports dual accounts)"""
+        """Close a specific position by ID via isolated worker process"""
 
         position = self.active_positions.get(position_id)
         if not position or position.is_closing:
@@ -1082,67 +875,36 @@ class TradingEngine:
         if market_index is None:
             return
 
-        # For closing: reverse the side
+        # For closing: reverse the side's price
         if position.is_long:
             price = 1  # Sell at any price
-            is_ask = True
         else:
             price = 999999999  # Buy at any price
-            is_ask = False
-
-        # Select the appropriate client
-        client = self.client_1 if position.account_num == 1 else self.client_2
 
         logger.info(f"📉 Closing {position.position_type.upper()} {position.token} on Account {position.account_num} "
                     f"(ID: {position_id})")
 
-        # Retry logic for transient errors
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                # Get order index and fresh nonce for this account
-                order_index = await self.get_next_order_index(position.account_num)
-                nonce = await self.get_next_nonce(position.account_num)
+        # Get order index for tracking
+        order_index = await self.get_next_order_index(position.account_num)
 
-                # Sign order
-                tx_info, error = client.sign_create_order(
-                    market_index=market_index,
-                    client_order_index=order_index,
-                    base_amount=position.base_amount,
-                    price=price,
-                    is_ask=is_ask,
-                    order_type=client.ORDER_TYPE_MARKET,
-                    time_in_force=client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
-                    reduce_only=True,  # True for closing position
-                    trigger_price=0,
-                    order_expiry=0,  # 0 for IOC
-                    nonce=nonce
-                )
-
-                if error:
-                    logger.error(f"Failed to sign close order: {error}")
-                    position.is_closing = False  # Reset flag on error
-                    return
-
-                # Send transaction using account-specific transaction API
-                transaction_api = self.transaction_api_1 if position.account_num == 1 else self.transaction_api_2
-                result = await transaction_api.send_tx(
-                    tx_type=client.TX_TYPE_CREATE_ORDER,
-                    tx_info=tx_info
-                )
-                # If successful, break out of retry loop
-                break
-
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    logger.warning(f"Error closing position on Account {position.account_num} (attempt {attempt + 1}/{max_retries}): {e}")
-                    await asyncio.sleep(1.0)  # Wait before retry
-                    continue
-                # Re-raise on final attempt
-                raise
-
-        # Success - log and cleanup
+        # Close position via isolated worker process
         try:
+            success = await self.account_manager.close_position(
+                account_num=position.account_num,
+                token=position.token,
+                market_index=market_index,
+                base_amount=position.base_amount,
+                is_long=position.is_long,
+                price=price,
+                order_index=order_index
+            )
+
+            if not success:
+                logger.error(f"Failed to close position {position_id}")
+                position.is_closing = False
+                return
+
+            # Success - log and cleanup
             # Log transaction
             tx = Transaction(
                 tx_type="close",
@@ -1154,7 +916,7 @@ class TradingEngine:
                 is_success=True,
                 dependency=position.open_tx_id,
                 order_id=f"Acc{position.account_num}_{order_index}",
-                tx_hash=str(result) if result else None
+                tx_hash=None
             )
             await self.db.log_transaction(tx)
 
