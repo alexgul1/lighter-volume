@@ -199,60 +199,90 @@ class TradingEngine:
         """Set leverage for all trading markets on both accounts"""
         imf = int(10000 / Config.DEFAULT_LEVERAGE)
 
+        # Sync nonces BEFORE leverage updates to ensure we start with correct nonce
+        logger.info("Syncing nonces before leverage updates...")
+        await self.sync_nonce_from_api(1)
+        await self.sync_nonce_from_api(2)
+
         for token in Config.TRADING_TOKENS:
             market_index = Config.MARKET_INDICES.get(token)
             if market_index is None:
                 continue
 
+            # Set leverage on Account 1 with retry logic
+            await self._set_leverage_with_retry(
+                account_num=1,
+                client=self.client_1,
+                token=token,
+                market_index=market_index,
+                imf=imf
+            )
+
+            # Respect rate limits between API calls
+            await asyncio.sleep(Config.SAFE_DELAY_BETWEEN_TRADES)
+
+            # Set leverage on Account 2 with retry logic
+            await self._set_leverage_with_retry(
+                account_num=2,
+                client=self.client_2,
+                token=token,
+                market_index=market_index,
+                imf=imf
+            )
+
+            # Respect rate limits between markets
+            await asyncio.sleep(Config.SAFE_DELAY_BETWEEN_TRADES)
+
+        logger.info("✅ Leverage updates completed for all markets")
+
+    async def _set_leverage_with_retry(
+        self,
+        account_num: int,
+        client: lighter.SignerClient,
+        token: str,
+        market_index: int,
+        imf: int
+    ):
+        """Set leverage for a single market with retry logic for nonce errors"""
+        max_retries = 2
+
+        for attempt in range(max_retries):
             try:
-                # Set leverage on Account 1
-                tx_info_1, error_1 = self.client_1.sign_update_leverage(
+                # Sign leverage update
+                tx_info, error = client.sign_update_leverage(
                     market_index=market_index,
                     fraction=imf,
-                    margin_mode=self.client_1.CROSS_MARGIN_MODE,
-                    nonce=await self.get_next_nonce(account_num=1)
+                    margin_mode=client.CROSS_MARGIN_MODE,
+                    nonce=await self.get_next_nonce(account_num=account_num)
                 )
 
-                if error_1:
-                    logger.error(f"Failed to sign leverage update for {token} on Account 1: {error_1}")
-                else:
-                    await self.transaction_api.send_tx(
-                        tx_type=self.client_1.TX_TYPE_UPDATE_LEVERAGE,
-                        tx_info=tx_info_1
-                    )
-                    logger.info(f"Set leverage {Config.DEFAULT_LEVERAGE}x for {token} on Account 1")
+                if error:
+                    logger.error(f"Failed to sign leverage update for {token} on Account {account_num}: {error}")
+                    return
 
-                # Respect rate limits between API calls
-                await asyncio.sleep(Config.SAFE_DELAY_BETWEEN_TRADES)
-
-                # Set leverage on Account 2
-                tx_info_2, error_2 = self.client_2.sign_update_leverage(
-                    market_index=market_index,
-                    fraction=imf,
-                    margin_mode=self.client_2.CROSS_MARGIN_MODE,
-                    nonce=await self.get_next_nonce(account_num=2)
+                # Send transaction
+                await self.transaction_api.send_tx(
+                    tx_type=client.TX_TYPE_UPDATE_LEVERAGE,
+                    tx_info=tx_info
                 )
 
-                if error_2:
-                    logger.error(f"Failed to sign leverage update for {token} on Account 2: {error_2}")
-                else:
-                    await self.transaction_api.send_tx(
-                        tx_type=self.client_2.TX_TYPE_UPDATE_LEVERAGE,
-                        tx_info=tx_info_2
-                    )
-                    logger.info(f"Set leverage {Config.DEFAULT_LEVERAGE}x for {token} on Account 2")
-
-                # Respect rate limits between markets
-                await asyncio.sleep(Config.SAFE_DELAY_BETWEEN_TRADES)
+                logger.info(f"Set leverage {Config.DEFAULT_LEVERAGE}x for {token} on Account {account_num}")
+                return  # Success
 
             except Exception as e:
-                logger.error(f"Failed to set leverage for {token}: {e}")
+                error_str = str(e).lower()
+                # Check if this is a nonce error
+                if "invalid nonce" in error_str or "nonce" in error_str:
+                    logger.warning(f"Nonce error setting leverage for {token} on Account {account_num} (attempt {attempt + 1}/{max_retries}): {e}")
+                    if attempt < max_retries - 1:
+                        # Sync nonce from API and retry
+                        await self.sync_nonce_from_api(account_num)
+                        await asyncio.sleep(0.5)
+                        continue
 
-        # Sync nonces from API after all leverage updates
-        # This ensures nonces are accurate before trading starts
-        logger.info("Syncing nonces after leverage updates...")
-        await self.sync_nonce_from_api(1)
-        await self.sync_nonce_from_api(2)
+                # Log error and continue with other markets
+                logger.error(f"Failed to set leverage for {token} on Account {account_num}: {e}")
+                return
 
     async def cleanup(self):
         """Cleanup resources"""
