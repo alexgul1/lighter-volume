@@ -240,10 +240,27 @@ class TradingEngine:
 
             response = await self.account_api.account(by="index", value=str(account_index))
 
-            # Debug: Log response type and attributes
-            logger.debug(f"Response type: {type(response)}")
-            logger.debug(f"Response attributes: {dir(response)}")
-            logger.debug(f"Response repr: {repr(response)}")
+            # 🔍 FULL DEBUG LOGGING
+            logger.info(f"🔍 === FULL API Response for Account {account_num} (index={account_index}) ===")
+            logger.info(f"Response type: {type(response)}")
+            logger.info(f"Response dir: {dir(response)}")
+            logger.info(f"Response repr: {repr(response)}")
+
+            # Try to log response as dict if possible
+            if hasattr(response, '__dict__'):
+                logger.info(f"Response __dict__: {response.__dict__}")
+
+            # Try to convert to dict/json
+            try:
+                import json
+                if hasattr(response, 'to_dict'):
+                    logger.info(f"Response to_dict():\n{json.dumps(response.to_dict(), indent=2, default=str)}")
+                elif hasattr(response, 'dict'):
+                    logger.info(f"Response dict():\n{json.dumps(response.dict(), indent=2, default=str)}")
+            except Exception as e:
+                logger.debug(f"Could not serialize response to JSON: {e}")
+
+            logger.info(f"🔍 === END Response Debug ===\n")
 
             # Handle different response formats from lighter SDK
             account_data = None
@@ -482,11 +499,18 @@ class TradingEngine:
 
             detail = details_response.order_book_details[0]
 
-            # Convert open interest to USDC value
-            # OI comes in base units of the token, need to convert to USDC
-            # OI in USDC = (oi_base_units / 10^size_decimals) * price
-            oi_in_tokens = detail.open_interest / (10 ** detail.size_decimals)
-            oi_in_usdc = oi_in_tokens * detail.last_trade_price
+            # Debug OI calculation
+            logger.info(f"🔍 OI Debug for {token}:")
+            logger.info(f"  Raw OI from API: {detail.open_interest}")
+            logger.info(f"  Price: ${detail.last_trade_price}")
+            logger.info(f"  Size decimals: {detail.size_decimals}")
+            logger.info(f"  Price decimals: {detail.price_decimals}")
+
+            # OI is already in USDC - no conversion needed!
+            # The API returns open_interest directly in USDC
+            oi_in_usdc = float(detail.open_interest) if detail.open_interest else 0.0
+
+            logger.info(f"  Final OI (USDC): ${oi_in_usdc:,.2f}")
 
             market_data = MarketData(
                 symbol=detail.symbol,
@@ -938,6 +962,40 @@ class TradingEngine:
         logger.info(f"📉 Closing {position.position_type.upper()} {position.token} on Account {position.account_num} "
                     f"(ID: {position_id})")
 
+        # Get current market data for exit price
+        market_data = await self.get_market_data(position.token)
+        exit_price = market_data.last_trade_price if market_data else None
+
+        # Get PnL BEFORE closing position (while position still exists in API)
+        pnl = None
+        try:
+            account_index = Config.ACCOUNT_1_INDEX if position.account_num == 1 else Config.ACCOUNT_2_INDEX
+            response = await self.account_api.account(by="index", value=str(account_index))
+
+            # Handle different response formats
+            account_data = None
+            if hasattr(response, 'data') and response.data:
+                account_data = response.data[0]
+            elif hasattr(response, 'sub_accounts') and response.sub_accounts:
+                account_data = response.sub_accounts[0]
+            elif hasattr(response, '__getitem__'):
+                account_data = response[0]
+            else:
+                account_data = response
+
+            # Find this specific position in the account data
+            if account_data and hasattr(account_data, 'positions'):
+                for pos_data in account_data.positions:
+                    if hasattr(pos_data, 'market_id') and pos_data.market_id == market_index:
+                        # Found the position - get its PnL
+                        unrealized = float(pos_data.unrealized_pnl) if hasattr(pos_data, 'unrealized_pnl') and pos_data.unrealized_pnl else 0.0
+                        realized = float(pos_data.realized_pnl) if hasattr(pos_data, 'realized_pnl') and pos_data.realized_pnl else 0.0
+                        pnl = unrealized + realized
+                        logger.info(f"Position PnL before close: unrealized=${unrealized:.2f}, realized=${realized:.2f}, total=${pnl:.2f}")
+                        break
+        except Exception as e:
+            logger.warning(f"Could not fetch PnL before closing position: {e}")
+
         # Get order index for tracking
         order_index = await self.get_next_order_index(position.account_num)
 
@@ -989,18 +1047,8 @@ class TradingEngine:
             # Calculate hold time
             hold_time_hours = (time.time() - position.open_time) / 3600
 
-            # Get PnL from position monitor if available
-            pnl = None
-            if self.position_monitor:
-                snapshot = self.position_monitor.get_position_snapshot(
-                    position.account_num,
-                    Config.MARKET_INDICES.get(position.token)
-                )
-                if snapshot:
-                    pnl = snapshot.unrealized_pnl + snapshot.realized_pnl
-
             logger.info(f"✅ Closed {position.position_type} {position.token} on Account {position.account_num} "
-                        f"(ID: {position_id}, Remaining: {remaining})")
+                        f"(ID: {position_id}, Remaining: {remaining}, PnL: ${pnl:.2f if pnl else 'N/A'})")
             logger.info(self.stats.get_stats_string())
 
             # Send Telegram notification for single position close
@@ -1012,6 +1060,7 @@ class TradingEngine:
                     account_num=position.account_num,
                     amount_usdc=position.amount_usdc,
                     entry_price=position.entry_price,
+                    exit_price=exit_price,
                     hold_time_hours=hold_time_hours,
                     pnl=pnl
                 )
