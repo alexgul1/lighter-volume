@@ -236,39 +236,81 @@ class TradingEngine:
         """
         try:
             account_index = Config.ACCOUNT_1_INDEX if account_num == 1 else Config.ACCOUNT_2_INDEX
+            logger.debug(f"Fetching balance for Account {account_num} (index={account_index})")
+
             response = await self.account_api.account(by="index", value=str(account_index))
+
+            # 🔍 FULL DEBUG LOGGING
+            logger.info(f"🔍 === FULL API Response for Account {account_num} (index={account_index}) ===")
+            logger.info(f"Response type: {type(response)}")
+            logger.info(f"Response dir: {dir(response)}")
+            logger.info(f"Response repr: {repr(response)}")
+
+            # Try to log response as dict if possible
+            if hasattr(response, '__dict__'):
+                logger.info(f"Response __dict__: {response.__dict__}")
+
+            # Try to convert to dict/json
+            try:
+                import json
+                if hasattr(response, 'to_dict'):
+                    logger.info(f"Response to_dict():\n{json.dumps(response.to_dict(), indent=2, default=str)}")
+                elif hasattr(response, 'dict'):
+                    logger.info(f"Response dict():\n{json.dumps(response.dict(), indent=2, default=str)}")
+            except Exception as e:
+                logger.debug(f"Could not serialize response to JSON: {e}")
+
+            logger.info(f"🔍 === END Response Debug ===\n")
 
             # Handle different response formats from lighter SDK
             account_data = None
             if hasattr(response, 'data') and response.data:
+                logger.debug(f"Using response.data[0], data length: {len(response.data)}")
                 account_data = response.data[0]
             elif hasattr(response, 'sub_accounts') and response.sub_accounts:
+                logger.debug(f"Using response.sub_accounts[0], sub_accounts length: {len(response.sub_accounts)}")
                 account_data = response.sub_accounts[0]
             elif hasattr(response, '__getitem__'):
-                # Response is directly indexable
+                logger.debug("Using response[0] (directly indexable)")
                 account_data = response[0]
             else:
-                # Response itself is the account data
+                logger.debug("Using response itself as account_data")
                 account_data = response
 
             if not account_data:
+                logger.warning(f"Account {account_num}: No account data found")
                 return (0.0, 0.0)
 
+            # Debug: Log account_data details
+            logger.debug(f"Account data type: {type(account_data)}")
+            logger.debug(f"Account data attributes: {dir(account_data)}")
+
             # Get available balance (USDC)
+            if hasattr(account_data, 'available_balance'):
+                logger.debug(f"Account {account_num} available_balance raw: {account_data.available_balance} (type: {type(account_data.available_balance)})")
+            else:
+                logger.warning(f"Account {account_num}: No 'available_balance' attribute")
+
             available_balance = float(account_data.available_balance) if hasattr(account_data, 'available_balance') and account_data.available_balance else 0.0
+            logger.info(f"Account {account_num} parsed available_balance: ${available_balance}")
 
             # Calculate total PnL (unrealized + realized)
             total_pnl = 0.0
             if hasattr(account_data, 'positions'):
+                logger.debug(f"Account {account_num} has {len(account_data.positions)} positions")
                 for position in account_data.positions:
                     unrealized_pnl = float(position.unrealized_pnl) if position.unrealized_pnl else 0.0
                     realized_pnl = float(position.realized_pnl) if position.realized_pnl else 0.0
                     total_pnl += unrealized_pnl + realized_pnl
+                    logger.debug(f"Position: unrealized={unrealized_pnl}, realized={realized_pnl}")
+            else:
+                logger.debug(f"Account {account_num}: No 'positions' attribute")
 
+            logger.info(f"Account {account_num} total PnL: ${total_pnl}")
             return (available_balance, total_pnl)
 
         except Exception as e:
-            logger.error(f"Failed to get account {account_num} balance: {e}")
+            logger.error(f"Failed to get account {account_num} balance: {e}", exc_info=True)
             return (0.0, 0.0)
 
     async def get_account_position_count(self, account_num: int) -> int:
@@ -457,11 +499,18 @@ class TradingEngine:
 
             detail = details_response.order_book_details[0]
 
-            # Convert open interest to USDC value
-            # OI comes in base units of the token, need to convert to USDC
-            # OI in USDC = (oi_base_units / 10^size_decimals) * price
-            oi_in_tokens = detail.open_interest / (10 ** detail.size_decimals)
-            oi_in_usdc = oi_in_tokens * detail.last_trade_price
+            # Debug OI calculation
+            logger.info(f"🔍 OI Debug for {token}:")
+            logger.info(f"  Raw OI from API: {detail.open_interest}")
+            logger.info(f"  Price: ${detail.last_trade_price}")
+            logger.info(f"  Size decimals: {detail.size_decimals}")
+            logger.info(f"  Price decimals: {detail.price_decimals}")
+
+            # OI is already in USDC - no conversion needed!
+            # The API returns open_interest directly in USDC
+            oi_in_usdc = float(detail.open_interest) if detail.open_interest else 0.0
+
+            logger.info(f"  Final OI (USDC): ${oi_in_usdc:,.2f}")
 
             market_data = MarketData(
                 symbol=detail.symbol,
@@ -577,18 +626,28 @@ class TradingEngine:
 
     async def stop(self):
         """Stop trading bot and close all positions"""
+        logger.info("🛑 === STARTING SHUTDOWN SEQUENCE ===")
         self.running = False
 
         # Close all open positions on shutdown
         if self.active_positions:
-            logger.info(f"🛑 Shutdown: Closing {len(self.active_positions)} open positions...")
+            logger.info(f"🛑 Shutdown: Found {len(self.active_positions)} open positions")
+            logger.info(f"Positions: {list(self.active_positions.keys())}")
+
             close_tasks = []
             for position_id, position in list(self.active_positions.items()):
+                logger.info(f"Checking position {position_id}: is_closing={position.is_closing}")
                 if not position.is_closing:
+                    logger.info(f"✓ Adding position {position_id} to close queue")
                     close_tasks.append(self._close_position(position_id))
+                else:
+                    logger.info(f"⚠️ Skipping position {position_id} - already closing")
 
             if close_tasks:
-                logger.info(f"⏳ Waiting for {len(close_tasks)} positions to close (timeout: 120s)...")
+                logger.info(f"⏳ Created {len(close_tasks)} close tasks. Starting parallel close (timeout: 120s)...")
+                import time
+                start_time = time.time()
+
                 try:
                     # Give enough time for worker processes to complete (60s each + buffer)
                     results = await asyncio.wait_for(
@@ -596,19 +655,34 @@ class TradingEngine:
                         timeout=120
                     )
 
+                    elapsed = time.time() - start_time
+                    logger.info(f"⏱️ Close tasks completed in {elapsed:.2f}s")
+
                     # Log any errors
+                    success_count = 0
+                    error_count = 0
                     for i, result in enumerate(results):
                         if isinstance(result, Exception):
-                            logger.error(f"Error closing position: {result}")
+                            logger.error(f"❌ Error closing position #{i}: {result}")
+                            error_count += 1
+                        else:
+                            success_count += 1
 
-                    logger.info("✅ All positions closed successfully")
+                    logger.info(f"✅ Close results: {success_count} successful, {error_count} errors")
+                    logger.info(f"Remaining active positions: {len(self.active_positions)}")
+
                 except asyncio.TimeoutError:
-                    logger.error("❌ Timeout waiting for positions to close")
+                    elapsed = time.time() - start_time
+                    logger.error(f"❌ Timeout waiting for positions to close after {elapsed:.2f}s")
                     logger.warning(f"⚠️ {len([p for p in self.active_positions.values() if not p.is_closing])} positions may still be open")
+                    logger.warning(f"Still active: {list(self.active_positions.keys())}")
+            else:
+                logger.info("No positions need closing (all already marked as closing)")
         else:
             logger.info("No open positions to close")
 
-        logger.info("Trading bot stopped")
+        logger.info("🛑 === SHUTDOWN COMPLETE ===")
+        logger.info(f"Final active positions count: {len(self.active_positions)}")
         logger.info(self.stats.get_stats_string())
 
     async def _trading_loop(self):
@@ -891,17 +965,25 @@ class TradingEngine:
 
     async def _close_position(self, position_id: str):
         """Close a specific position by ID via isolated worker process"""
+        logger.info(f"🔄 _close_position() called for {position_id}")
 
         position = self.active_positions.get(position_id)
-        if not position or position.is_closing:
+        if not position:
+            logger.warning(f"⚠️ Position {position_id} not found in active_positions")
+            return
+
+        if position.is_closing:
+            logger.warning(f"⚠️ Position {position_id} already marked as closing")
             return
 
         # Mark as closing to prevent double closing
+        logger.info(f"✓ Marking position {position_id} as closing")
         position.is_closing = True
 
         # Get market index
         market_index = Config.MARKET_INDICES.get(position.token)
         if market_index is None:
+            logger.error(f"❌ No market index for token {position.token}")
             return
 
         # For closing: reverse the side's price
@@ -911,13 +993,55 @@ class TradingEngine:
             price = 999999999  # Buy at any price
 
         logger.info(f"📉 Closing {position.position_type.upper()} {position.token} on Account {position.account_num} "
-                    f"(ID: {position_id})")
+                    f"(ID: {position_id}, market_index={market_index}, price={price})")
+
+        # Get current market data for exit price
+        market_data = await self.get_market_data(position.token)
+        exit_price = market_data.last_trade_price if market_data else None
+
+        # Get PnL BEFORE closing position (while position still exists in API)
+        pnl = None
+        try:
+            account_index = Config.ACCOUNT_1_INDEX if position.account_num == 1 else Config.ACCOUNT_2_INDEX
+            response = await self.account_api.account(by="index", value=str(account_index))
+
+            # Handle different response formats
+            account_data = None
+            if hasattr(response, 'data') and response.data:
+                account_data = response.data[0]
+            elif hasattr(response, 'sub_accounts') and response.sub_accounts:
+                account_data = response.sub_accounts[0]
+            elif hasattr(response, '__getitem__'):
+                account_data = response[0]
+            else:
+                account_data = response
+
+            # Find this specific position in the account data
+            if account_data and hasattr(account_data, 'positions'):
+                for pos_data in account_data.positions:
+                    if hasattr(pos_data, 'market_id') and pos_data.market_id == market_index:
+                        # Found the position - get its PnL
+                        unrealized = float(pos_data.unrealized_pnl) if hasattr(pos_data, 'unrealized_pnl') and pos_data.unrealized_pnl else 0.0
+                        realized = float(pos_data.realized_pnl) if hasattr(pos_data, 'realized_pnl') and pos_data.realized_pnl else 0.0
+                        pnl = unrealized + realized
+                        logger.info(f"Position PnL before close: unrealized=${unrealized:.2f}, realized=${realized:.2f}, total=${pnl:.2f}")
+                        break
+        except Exception as e:
+            logger.warning(f"Could not fetch PnL before closing position: {e}")
 
         # Get order index for tracking
         order_index = await self.get_next_order_index(position.account_num)
+        logger.info(f"✓ Got order index: {order_index}")
 
         # Close position via isolated worker process
         try:
+            logger.info(f"⏳ Calling account_manager.close_position() for {position_id}...")
+            logger.info(f"   Account: {position.account_num}, Token: {position.token}, Market: {market_index}")
+            logger.info(f"   Base amount: {position.base_amount}, Is long: {position.is_long}, Order index: {order_index}")
+
+            import time
+            call_start = time.time()
+
             success = await self.account_manager.close_position(
                 account_num=position.account_num,
                 token=position.token,
@@ -928,10 +1052,15 @@ class TradingEngine:
                 order_index=order_index
             )
 
+            call_duration = time.time() - call_start
+            logger.info(f"⏱️ account_manager.close_position() returned after {call_duration:.2f}s: success={success}")
+
             if not success:
-                logger.error(f"Failed to close position {position_id}")
+                logger.error(f"❌ account_manager.close_position() returned False for {position_id}")
                 position.is_closing = False
                 return
+
+            logger.info(f"✓ Position {position_id} closed successfully via worker")
 
             # Success - log and cleanup
             # Log transaction
@@ -964,18 +1093,8 @@ class TradingEngine:
             # Calculate hold time
             hold_time_hours = (time.time() - position.open_time) / 3600
 
-            # Get PnL from position monitor if available
-            pnl = None
-            if self.position_monitor:
-                snapshot = self.position_monitor.get_position_snapshot(
-                    position.account_num,
-                    Config.MARKET_INDICES.get(position.token)
-                )
-                if snapshot:
-                    pnl = snapshot.unrealized_pnl + snapshot.realized_pnl
-
             logger.info(f"✅ Closed {position.position_type} {position.token} on Account {position.account_num} "
-                        f"(ID: {position_id}, Remaining: {remaining})")
+                        f"(ID: {position_id}, Remaining: {remaining}, PnL: ${pnl:.2f if pnl else 'N/A'})")
             logger.info(self.stats.get_stats_string())
 
             # Send Telegram notification for single position close
@@ -987,6 +1106,7 @@ class TradingEngine:
                     account_num=position.account_num,
                     amount_usdc=position.amount_usdc,
                     entry_price=position.entry_price,
+                    exit_price=exit_price,
                     hold_time_hours=hold_time_hours,
                     pnl=pnl
                 )
