@@ -418,25 +418,79 @@ class TradingEngine:
             return f"❌ Error fetching balances: {e}"
 
     async def _handle_pnl_command(self) -> str:
-        """Handle /pnl command"""
+        """Handle /pnl command - shows trading PnL for 24h, 7d, and all time"""
         try:
-            _, pnl_1 = await self.get_account_balance(1)
-            _, pnl_2 = await self.get_account_balance(2)
-            total_pnl = pnl_1 + pnl_2
+            now_ms = int(time.time() * 1000)
 
-            pnl1_emoji = "💚" if pnl_1 >= 0 else "❤️"
-            pnl2_emoji = "💚" if pnl_2 >= 0 else "❤️"
-            total_pnl_emoji = "💚" if total_pnl >= 0 else "❤️"
+            # Calculate time periods in milliseconds
+            ms_24h = 24 * 60 * 60 * 1000
+            ms_7d = 7 * 24 * 60 * 60 * 1000
+            ms_all_time = 365 * 24 * 60 * 60 * 1000  # Last year
+
+            async def get_period_pnl(account_index: int, start_ms: int) -> float:
+                """Get trading PnL for a specific period"""
+                try:
+                    response = await self.account_api.pnl(
+                        by="accountIndex",
+                        value=str(account_index),
+                        resolution="1h",
+                        start_timestamp=start_ms,
+                        end_timestamp=now_ms,
+                        count_back=1000,
+                        ignore_transfers=True  # Only trading PnL
+                    )
+
+                    if not response or not response.pnl:
+                        return 0.0
+
+                    # Get first and last entry trade_pnl to calculate change
+                    first_pnl = float(response.pnl[0].trade_pnl) if len(response.pnl) > 0 else 0.0
+                    last_pnl = float(response.pnl[-1].trade_pnl) if len(response.pnl) > 0 else 0.0
+
+                    return last_pnl - first_pnl
+
+                except Exception as e:
+                    logger.debug(f"Failed to get PnL for account {account_index}: {e}")
+                    return 0.0
+
+            # Get PnL for both accounts across all periods
+            acc1_24h = await get_period_pnl(Config.ACCOUNT_1_INDEX, now_ms - ms_24h)
+            acc1_7d = await get_period_pnl(Config.ACCOUNT_1_INDEX, now_ms - ms_7d)
+            acc1_all = await get_period_pnl(Config.ACCOUNT_1_INDEX, now_ms - ms_all_time)
+
+            acc2_24h = await get_period_pnl(Config.ACCOUNT_2_INDEX, now_ms - ms_24h)
+            acc2_7d = await get_period_pnl(Config.ACCOUNT_2_INDEX, now_ms - ms_7d)
+            acc2_all = await get_period_pnl(Config.ACCOUNT_2_INDEX, now_ms - ms_all_time)
+
+            # Calculate totals
+            total_24h = acc1_24h + acc2_24h
+            total_7d = acc1_7d + acc2_7d
+            total_all = acc1_all + acc2_all
+
+            # Format with emojis
+            def fmt(val: float) -> str:
+                emoji = "💚" if val >= 0 else "❤️"
+                return f"{emoji} ${val:+.2f}"
 
             return (
-                f"📊 <b>Profit & Loss</b>\n\n"
-                f"<b>Account 1:</b> {pnl1_emoji} ${pnl_1:+.2f}\n"
-                f"<b>Account 2:</b> {pnl2_emoji} ${pnl_2:+.2f}\n"
-                f"<b>Total:</b> {total_pnl_emoji} <b>${total_pnl:+.2f}</b>\n"
+                f"📊 <b>Trading Profit & Loss</b>\n\n"
+                f"<b>24 Hours:</b>\n"
+                f"  Account 1: {fmt(acc1_24h)}\n"
+                f"  Account 2: {fmt(acc2_24h)}\n"
+                f"  <b>Total: {fmt(total_24h)}</b>\n\n"
+                f"<b>7 Days:</b>\n"
+                f"  Account 1: {fmt(acc1_7d)}\n"
+                f"  Account 2: {fmt(acc2_7d)}\n"
+                f"  <b>Total: {fmt(total_7d)}</b>\n\n"
+                f"<b>All Time:</b>\n"
+                f"  Account 1: {fmt(acc1_all)}\n"
+                f"  Account 2: {fmt(acc2_all)}\n"
+                f"  <b>Total: {fmt(total_all)}</b>\n"
                 f"\n⏰ {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}"
             )
         except Exception as e:
-            return f"❌ Error fetching P/L: {e}"
+            logger.error(f"Error in /pnl command: {e}", exc_info=True)
+            return f"❌ Error fetching trading P/L: {e}"
 
     async def _handle_status_command(self) -> str:
         """Handle /status command"""
@@ -1152,9 +1206,6 @@ class TradingEngine:
                 # If paired position was already closed, send hedged pair summary
                 if not paired_pos:
                     await self._send_hedged_pair_summary(position, position_id)
-
-            # Send balance notification after closing position
-            await self.send_balance_notification()
 
         except Exception as e:
             logger.error(f"Failed to close position {position_id}: {e}")
