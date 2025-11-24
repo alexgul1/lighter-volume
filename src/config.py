@@ -114,7 +114,8 @@ class Config:
         "LINK": 5,
         "UNI": 6,
         "AAVE": 7,
-        "HYPE": 24
+        "HYPE": 24,
+        "VIRTUAL": 41
     }
 
     @classmethod
