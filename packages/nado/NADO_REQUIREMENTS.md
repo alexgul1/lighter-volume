@@ -100,5 +100,5 @@ Please provide or add to `packages/nado/docs/`:
 Run locally to get full docs:
 cd packages/nado
 pip install -r requirements.txt
-python scrape_gitbook.py https://docs.nado.xyz -m 100
+py
 ```
