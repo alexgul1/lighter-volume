@@ -1,17 +1,22 @@
 """
 Nado.xyz Fast Token Rotation Trading Engine
 
-Implements fast buy/sell cycles on Nado DEX for volume generation.
+Uses official nado-protocol SDK for trading operations.
 """
 import asyncio
 import random
 import time
 import logging
-from typing import Optional, Dict, List
+from typing import Optional, Dict
 from dataclasses import dataclass, field
 
+from nado_protocol.client import create_nado_client, NadoClient, NadoClientMode
+from nado_protocol.engine_client.types.execute import PlaceMarketOrderParams
+from nado_protocol.utils.execute import MarketOrderParams
+from nado_protocol.utils.subaccount import SubaccountParams
+from nado_protocol.utils.math import to_x18, from_x18
+
 from src.config import Config
-from src.client import NadoClient, OrderAppendix, from_x18
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +62,7 @@ class ActivePosition:
 
 class TradingEngine:
     """
-    Fast token rotation engine for Nado.
+    Fast token rotation engine for Nado using official SDK.
 
     Strategy:
     1. Open position (buy or sell)
@@ -75,60 +80,90 @@ class TradingEngine:
         # Active positions (product_id -> position)
         self.positions: Dict[int, ActivePosition] = {}
 
-        # Product info cache
-        self.products: Dict[int, Dict] = {}
+        # Subaccount sender hex
+        self._sender_hex: Optional[str] = None
+
+    def _get_client_mode(self) -> NadoClientMode:
+        """Map config network to SDK mode"""
+        if Config.NETWORK == "mainnet":
+            return NadoClientMode.MAINNET
+        elif Config.NETWORK == "testnet":
+            return NadoClientMode.TESTNET
+        else:
+            return NadoClientMode.DEVNET
 
     async def initialize(self):
         """Initialize the trading engine"""
-        logger.info("Initializing Nado Trading Engine...")
+        logger.info("Initializing Nado Trading Engine with official SDK...")
 
         # Validate config
         Config.validate()
 
-        # Create client
-        self.client = NadoClient()
+        # Create client using official SDK
+        mode = self._get_client_mode()
+        private_key = Config.PRIVATE_KEY
 
-        # Fetch and cache products
-        await self._load_products()
+        logger.info(f"Creating Nado client (mode={mode})...")
+        self.client = create_nado_client(mode, private_key)
+
+        # Get signer address and build sender hex
+        signer_address = self.client.context.engine_client.signer.address
+        self._sender_hex = self._build_sender_hex(signer_address, Config.SUBACCOUNT_NAME)
+
+        logger.info(f"Client initialized:")
+        logger.info(f"  Network: {Config.NETWORK}")
+        logger.info(f"  Address: {signer_address}")
+        logger.info(f"  Subaccount: {Config.SUBACCOUNT_NAME}")
+        logger.info(f"  Sender: {self._sender_hex}")
 
         # Check subaccount exists
-        info = await self.client.get_subaccount_info()
+        info = self.client.subaccount.get_engine_subaccount_summary(self._sender_hex)
         if not info.exists:
             raise Exception(
                 f"Subaccount does not exist. Please deposit at least $5 USDT0 first. "
-                f"Sender: {self.client.sender}"
+                f"Sender: {self._sender_hex}"
             )
 
         # Log initial balance
-        usdt_balance = from_x18(info.spot_balances.get(0, 0))
+        usdt_balance = self._get_usdt_balance(info)
+        health = self._get_health(info)
         logger.info(f"Subaccount USDT0 balance: ${usdt_balance:,.2f}")
-        logger.info(f"Health (initial): {from_x18(info.health_initial):.4f}")
+        logger.info(f"Health (initial): {health:.4f}")
 
         # Notify telegram
         if self.telegram:
             await self.telegram.send_message(
-                f"🚀 *Nado Bot Started*\n\n"
+                f"*Nado Bot Started*\n\n"
                 f"Network: `{Config.NETWORK}`\n"
-                f"Address: `{self.client.address[:10]}...`\n"
+                f"Address: `{signer_address[:10]}...`\n"
                 f"Balance: ${usdt_balance:,.2f}\n"
                 f"Products: {[Config.get_product_symbol(p) for p in Config.TRADING_PRODUCTS]}"
             )
 
         logger.info("Trading engine initialized successfully")
 
-    async def _load_products(self):
-        """Load product info from API"""
-        products = await self.client.get_all_products()
-        for product in products:
-            pid = product.get("product_id")
-            if pid is not None:
-                self.products[pid] = product
-        logger.info(f"Loaded {len(self.products)} products")
+    def _build_sender_hex(self, address: str, subaccount_name: str) -> str:
+        """Build sender bytes32 hex: address (20 bytes) + subaccount name (12 bytes)"""
+        addr_hex = address.lower().replace("0x", "")
+        name_bytes = subaccount_name.encode('utf-8')
+        name_hex = name_bytes.hex().ljust(24, '0')  # 12 bytes = 24 hex chars
+        return "0x" + addr_hex + name_hex
+
+    def _get_usdt_balance(self, info) -> float:
+        """Extract USDT balance from subaccount info"""
+        for balance in info.spot_balances:
+            if balance.product_id == 0:  # USDT0 is product 0
+                return from_x18(int(balance.balance))
+        return 0.0
+
+    def _get_health(self, info) -> float:
+        """Extract initial health from subaccount info"""
+        if info.healths and len(info.healths) > 0:
+            return from_x18(int(info.healths[0].health))
+        return 0.0
 
     async def cleanup(self):
         """Cleanup resources"""
-        if self.client:
-            await self.client.close()
         logger.info("Trading engine cleanup complete")
 
     async def start(self):
@@ -170,7 +205,7 @@ class TradingEngine:
 
         if self.telegram:
             await self.telegram.send_message(
-                f"🛑 *Nado Bot Stopped*\n\n"
+                f"*Nado Bot Stopped*\n\n"
                 f"Total trades: {self.stats.total_trades}\n"
                 f"Success rate: {self.stats.success_rate:.1f}%\n"
                 f"Volume: ${self.stats.total_volume_usd:,.2f}\n"
@@ -200,9 +235,7 @@ class TradingEngine:
                 await asyncio.sleep(5)  # Wait before retry
 
     async def _execute_rotation(self, product_id: int):
-        """
-        Execute a single rotation cycle: open -> wait -> close
-        """
+        """Execute a single rotation cycle: open -> wait -> close"""
         symbol = Config.get_product_symbol(product_id)
         logger.info(f"Starting rotation on {symbol}")
 
@@ -213,15 +246,17 @@ class TradingEngine:
 
         # Get current price
         try:
-            market = await self.client.get_market_price(product_id)
-            if market.bid == 0 or market.ask == 0:
+            market = self.client.market.get_latest_market_price(product_id)
+            bid = from_x18(int(market.bid))
+            ask = from_x18(int(market.ask))
+            if bid == 0 or ask == 0:
                 logger.warning(f"No market for {symbol}, skipping")
                 return
         except Exception as e:
             logger.error(f"Failed to get market price for {symbol}: {e}")
             return
 
-        current_price = market.mid_price
+        current_price = (bid + ask) / 2
         trade_size = trade_amount / current_price  # Base asset size
 
         direction = "LONG" if is_long else "SHORT"
@@ -230,26 +265,46 @@ class TradingEngine:
             f"({trade_size:.6f} @ ${current_price:.2f})"
         )
 
-        # Open position
+        # Open position using SDK
         try:
-            result = await self.client.place_market_order(
-                product_id=product_id,
-                amount_usd=trade_amount,
-                is_buy=is_long
+            # Amount is positive for long, negative for short
+            amount_x18 = to_x18(trade_size if is_long else -trade_size)
+
+            # Build subaccount params
+            subaccount = SubaccountParams(
+                subaccount_owner=self.client.context.engine_client.signer.address,
+                subaccount_name=Config.SUBACCOUNT_NAME
             )
+
+            # Build market order params
+            market_order = MarketOrderParams(
+                sender=subaccount,
+                amount=amount_x18,
+                nonce=None  # SDK will generate
+            )
+
+            params = PlaceMarketOrderParams(
+                product_id=product_id,
+                market_order=market_order,
+                slippage=0.01,  # 1% slippage
+                spot_leverage=Config.USE_SPOT_LEVERAGE
+            )
+
+            result = self.client.market.place_market_order(params)
 
             self.stats.total_trades += 1
             self.stats.successful_trades += 1
             self.stats.total_volume_usd += trade_amount
 
             # Track position
+            digest = result.data.digest if result.data else None
             self.positions[product_id] = ActivePosition(
                 product_id=product_id,
                 is_long=is_long,
                 amount=trade_size,
                 entry_price=current_price,
                 open_time=time.time(),
-                order_digest=result.get("data", {}).get("digest")
+                order_digest=digest
             )
 
             logger.info(f"Opened {direction} {symbol} successfully")
@@ -281,8 +336,8 @@ class TradingEngine:
 
         # Get current price for PnL calculation
         try:
-            market = await self.client.get_market_price(product_id)
-            exit_price = market.mid_price
+            market = self.client.market.get_latest_market_price(product_id)
+            exit_price = (from_x18(int(market.bid)) + from_x18(int(market.ask))) / 2
         except:
             exit_price = position.entry_price
 
@@ -298,20 +353,18 @@ class TradingEngine:
             f"PnL=${pnl:+.4f}"
         )
 
-        # Close by placing opposite order
+        # Close using SDK's close_position method
         try:
-            close_amount_usd = position.amount * exit_price
-
-            result = await self.client.place_market_order(
-                product_id=product_id,
-                amount_usd=close_amount_usd,
-                is_buy=not position.is_long,  # Opposite direction
-                reduce_only=True
+            subaccount = SubaccountParams(
+                subaccount_owner=self.client.context.engine_client.signer.address,
+                subaccount_name=Config.SUBACCOUNT_NAME
             )
+
+            result = self.client.market.close_position(subaccount, product_id)
 
             self.stats.total_trades += 1
             self.stats.successful_trades += 1
-            self.stats.total_volume_usd += close_amount_usd
+            self.stats.total_volume_usd += position.amount * exit_price
 
             del self.positions[product_id]
             logger.info(f"Closed {direction} {symbol}, PnL: ${pnl:+.4f}")
@@ -326,14 +379,14 @@ class TradingEngine:
 
     async def get_status(self) -> Dict:
         """Get current bot status"""
-        info = await self.client.get_subaccount_info()
-        usdt_balance = from_x18(info.spot_balances.get(0, 0))
+        info = self.client.subaccount.get_engine_subaccount_summary(self._sender_hex)
+        usdt_balance = self._get_usdt_balance(info)
 
         return {
             "running": self.running,
-            "address": self.client.address,
+            "address": self.client.context.engine_client.signer.address,
             "balance_usd": usdt_balance,
-            "health": from_x18(info.health_initial),
+            "health": self._get_health(info),
             "open_positions": len(self.positions),
             "stats": {
                 "total_trades": self.stats.total_trades,

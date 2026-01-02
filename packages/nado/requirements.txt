@@ -1,14 +1,13 @@
 # Nado Trading Bot Dependencies
 
-# HTTP client
-httpx>=0.25.0
-
-# Ethereum / EIP-712 signing
-eth-account>=0.11.0
-eth-typing>=3.5.0
+# Official Nado SDK
+nado-protocol>=0.1.0
 
 # Environment
 python-dotenv>=1.0.0
+
+# HTTP client (for telegram notifier)
+httpx>=0.25.0
 
 # Scraper (optional, for docs)
 requests>=2.31.0

@@ -11,49 +11,8 @@ load_dotenv()
 class Config:
     """Configuration for Nado fast token rotation bot"""
 
-    # Network Configuration
-    NETWORK = os.getenv("NADO_NETWORK", "mainnet")  # mainnet or testnet
-
-    # Chain IDs (from docs)
-    MAINNET_CHAIN_ID = 57073
-    TESTNET_CHAIN_ID = 763373
-
-    # Endpoint addresses (verifyingContract for non-order operations)
-    MAINNET_ENDPOINT = "0x05ec92D78ED421f3D3Ada77FFdE167106565974E"
-    TESTNET_ENDPOINT = "0x698D87105274292B5673367DEC81874Ce3633Ac2"
-
-    @classmethod
-    def get_chain_id(cls) -> int:
-        return cls.MAINNET_CHAIN_ID if cls.NETWORK == "mainnet" else cls.TESTNET_CHAIN_ID
-
-    @classmethod
-    def get_endpoint_address(cls) -> str:
-        return cls.MAINNET_ENDPOINT if cls.NETWORK == "mainnet" else cls.TESTNET_ENDPOINT
-
-    # API Endpoints
-    @classmethod
-    def get_gateway_rest(cls) -> str:
-        if cls.NETWORK == "mainnet":
-            return "https://gateway.prod.nado.xyz/v1"
-        return "https://gateway.test.nado.xyz/v1"
-
-    @classmethod
-    def get_gateway_ws(cls) -> str:
-        if cls.NETWORK == "mainnet":
-            return "wss://gateway.prod.nado.xyz/v1/ws"
-        return "wss://gateway.test.nado.xyz/v1/ws"
-
-    @classmethod
-    def get_subscribe_ws(cls) -> str:
-        if cls.NETWORK == "mainnet":
-            return "wss://gateway.prod.nado.xyz/v1/subscribe"
-        return "wss://gateway.test.nado.xyz/v1/subscribe"
-
-    @classmethod
-    def get_archive_url(cls) -> str:
-        if cls.NETWORK == "mainnet":
-            return "https://archive.prod.nado.xyz/v1"
-        return "https://archive.test.nado.xyz/v1"
+    # Network Configuration (mainnet, testnet, or devnet)
+    NETWORK = os.getenv("NADO_NETWORK", "mainnet")
 
     # Account Configuration
     PRIVATE_KEY = os.getenv("NADO_PRIVATE_KEY", "")
@@ -75,7 +34,7 @@ class Config:
         6: "XRP-PERP",
     }
 
-    # Trade amounts (in USDC, will be multiplied by 1e18)
+    # Trade amounts (in USD)
     MIN_TRADE_AMOUNT = float(os.getenv("NADO_MIN_TRADE_AMOUNT", "10.0"))
     MAX_TRADE_AMOUNT = float(os.getenv("NADO_MAX_TRADE_AMOUNT", "50.0"))
 
@@ -105,14 +64,6 @@ class Config:
     # Logging
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
-    # Order parameters
-    ORDER_EXPIRATION_SECONDS = int(os.getenv("NADO_ORDER_EXPIRATION", "60"))  # 1 minute default
-    NONCE_RECV_TIME_OFFSET_MS = int(os.getenv("NADO_NONCE_OFFSET_MS", "5000"))  # 5 seconds
-
-    # EIP-712 Domain (constant)
-    EIP712_DOMAIN_NAME = "Nado"
-    EIP712_DOMAIN_VERSION = "0.0.1"
-
     @classmethod
     def validate(cls):
         """Validate configuration"""
@@ -137,6 +88,9 @@ class Config:
 
         if cls.MIN_TRADE_AMOUNT > cls.MAX_TRADE_AMOUNT:
             raise ValueError("MIN_TRADE_AMOUNT cannot exceed MAX_TRADE_AMOUNT")
+
+        if cls.NETWORK not in ("mainnet", "testnet", "devnet"):
+            raise ValueError(f"NADO_NETWORK must be mainnet, testnet, or devnet, got {cls.NETWORK}")
 
     @classmethod
     def get_product_symbol(cls, product_id: int) -> str:
