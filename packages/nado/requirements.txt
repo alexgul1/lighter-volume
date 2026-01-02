@@ -1,5 +1,8 @@
+# Scraper
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+
 # TBD - depends on nado.xyz SDK/API
-# Likely candidates:
 # httpx or aiohttp for async HTTP
 # web3 if EVM-based
 # python-telegram-bot for notifications
