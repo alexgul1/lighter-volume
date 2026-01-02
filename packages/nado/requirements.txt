@@ -1,8 +1,15 @@
-# Scraper
+# Nado Trading Bot Dependencies
+
+# HTTP client
+httpx>=0.25.0
+
+# Ethereum / EIP-712 signing
+eth-account>=0.11.0
+eth-typing>=3.5.0
+
+# Environment
+python-dotenv>=1.0.0
+
+# Scraper (optional, for docs)
 requests>=2.31.0
 beautifulsoup4>=4.12.0
-
-# TBD - depends on nado.xyz SDK/API
-# httpx or aiohttp for async HTTP
-# web3 if EVM-based
-# python-telegram-bot for notifications
