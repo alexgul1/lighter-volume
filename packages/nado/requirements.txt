@@ -1,8 +1,14 @@
-# Scraper
+# Nado Trading Bot Dependencies
+
+# Official Nado SDK
+nado-protocol>=0.1.0
+
+# Environment
+python-dotenv>=1.0.0
+
+# HTTP client (for telegram notifier)
+httpx>=0.25.0
+
+# Scraper (optional, for docs)
 requests>=2.31.0
 beautifulsoup4>=4.12.0
-
-# TBD - depends on nado.xyz SDK/API
-# httpx or aiohttp for async HTTP
-# web3 if EVM-based
-# python-telegram-bot for notifications
