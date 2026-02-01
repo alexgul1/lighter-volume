@@ -153,12 +153,14 @@ class TradingEngine:
         """Extract USDT balance from subaccount info"""
         for balance in info.spot_balances:
             if balance.product_id == 0:  # USDT0 is product 0
-                return from_x18(int(balance.balance))
+                # SpotProductBalance.balance is SpotBalance, SpotBalance.amount is str
+                return from_x18(int(balance.balance.amount))
         return 0.0
 
     def _get_health(self, info) -> float:
         """Extract initial health from subaccount info"""
         if info.healths and len(info.healths) > 0:
+            # SubaccountHealth.health is str
             return from_x18(int(info.healths[0].health))
         return 0.0
 
@@ -247,8 +249,9 @@ class TradingEngine:
         # Get current price
         try:
             market = self.client.market.get_latest_market_price(product_id)
-            bid = from_x18(int(market.bid))
-            ask = from_x18(int(market.ask))
+            # MarketPriceData has bid_x18 and ask_x18 as strings
+            bid = from_x18(int(market.bid_x18))
+            ask = from_x18(int(market.ask_x18))
             if bid == 0 or ask == 0:
                 logger.warning(f"No market for {symbol}, skipping")
                 return
@@ -337,7 +340,7 @@ class TradingEngine:
         # Get current price for PnL calculation
         try:
             market = self.client.market.get_latest_market_price(product_id)
-            exit_price = (from_x18(int(market.bid)) + from_x18(int(market.ask))) / 2
+            exit_price = (from_x18(int(market.bid_x18)) + from_x18(int(market.ask_x18))) / 2
         except:
             exit_price = position.entry_price
 
