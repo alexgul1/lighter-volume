@@ -156,28 +156,43 @@ class TradingEngine:
         return "0x" + addr_hex + name_hex
 
     async def _load_product_info(self):
-        """Load size_increment for all trading products"""
-        logger.info("Loading product info...")
+        """Load size_increment and symbols for all trading products"""
+        logger.info("Loading product info from engine...")
 
         # Get all products from engine
         all_products = self.client.market.get_all_engine_markets()
 
-        # Cache size_increment for perp products
+        # Log all available perp products
+        logger.info("Available PERP products:")
         for product in all_products.perp_products:
             product_id = int(product.product_id)
+            symbol = getattr(product, 'symbol', f'PERP-{product_id}')
             size_increment = int(product.book_info.size_increment)
             min_size = int(product.book_info.min_size)
-            self._size_increments[product_id] = size_increment
 
-            if product_id in Config.TRADING_PRODUCTS:
-                symbol = Config.get_product_symbol(product_id)
-                # Convert to human-readable
-                size_inc_human = from_x18(size_increment)
-                min_size_human = from_x18(min_size)
-                logger.info(
-                    f"  {symbol}: size_increment={size_inc_human}, "
-                    f"min_size={min_size_human}"
-                )
+            # Cache size_increment and symbol
+            self._size_increments[product_id] = size_increment
+            Config.PRODUCT_SYMBOLS[product_id] = symbol
+
+            size_inc_human = from_x18(size_increment)
+            min_size_human = from_x18(min_size)
+
+            is_trading = "✓" if product_id in Config.TRADING_PRODUCTS else " "
+            logger.info(
+                f"  [{is_trading}] ID={product_id} {symbol}: "
+                f"size_inc={size_inc_human}, min_size={min_size_human}"
+            )
+
+        # Also load spot products (for USDT0 symbol)
+        for product in all_products.spot_products:
+            product_id = int(product.product_id)
+            symbol = getattr(product, 'symbol', f'SPOT-{product_id}')
+            Config.PRODUCT_SYMBOLS[product_id] = symbol
+
+        # Validate configured products exist
+        for pid in Config.TRADING_PRODUCTS:
+            if pid not in self._size_increments:
+                logger.warning(f"Configured product ID {pid} not found in perp products!")
 
     def _get_usdt_balance(self, info) -> float:
         """Extract USDT balance from subaccount info"""
@@ -340,11 +355,12 @@ class TradingEngine:
                 nonce=None  # SDK will generate
             )
 
+            # Note: spot_leverage is only for spot products, not perp
+            # For perp markets, don't set spot_leverage
             params = PlaceMarketOrderParams(
                 product_id=product_id,
                 market_order=market_order,
-                slippage=0.01,  # 1% slippage
-                spot_leverage=Config.USE_SPOT_LEVERAGE
+                slippage=0.01  # 1% slippage
             )
 
             result = self.client.market.place_market_order(params)
