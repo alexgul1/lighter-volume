@@ -19,20 +19,14 @@ class Config:
     SUBACCOUNT_NAME = os.getenv("NADO_SUBACCOUNT_NAME", "default")  # max 12 bytes
 
     # Trading Configuration
-    # Product IDs: 0=USDT0, 2=ETH-PERP, 3=SOL-PERP, 4=BTC-PERP, 5=BNB-PERP, 6=XRP-PERP
+    # Product IDs are loaded dynamically from the API
+    # Check logs on startup to see available products and their IDs
     TRADING_PRODUCTS: List[int] = [
-        int(x.strip()) for x in os.getenv("NADO_TRADING_PRODUCTS", "2,4").split(",") if x.strip()
+        int(x.strip()) for x in os.getenv("NADO_TRADING_PRODUCTS", "4").split(",") if x.strip()
     ]
 
-    # Product ID to symbol mapping
-    PRODUCT_SYMBOLS: Dict[int, str] = {
-        0: "USDT0",
-        2: "ETH-PERP",
-        3: "SOL-PERP",
-        4: "BTC-PERP",
-        5: "BNB-PERP",
-        6: "XRP-PERP",
-    }
+    # Product ID to symbol mapping (fallback, actual symbols loaded from API)
+    PRODUCT_SYMBOLS: Dict[int, str] = {}
 
     # Trade amounts (in USD)
     MIN_TRADE_AMOUNT = float(os.getenv("NADO_MIN_TRADE_AMOUNT", "10.0"))
@@ -43,17 +37,13 @@ class Config:
     POSITION_HOLD_TIME_MAX = float(os.getenv("NADO_HOLD_TIME_MAX", "30.0"))  # seconds
     DELAY_BETWEEN_TRADES = float(os.getenv("NADO_DELAY_BETWEEN_TRADES", "2.0"))  # seconds
 
-    # Rate limits
-    # With spot leverage: 600 orders/min = 10/sec (weight=1 per order)
-    # Without: 30 orders/min (weight=20 per order)
-    USE_SPOT_LEVERAGE = os.getenv("NADO_USE_SPOT_LEVERAGE", "true").lower() == "true"
+    # Rate limit delay between orders (seconds)
+    RATE_LIMIT_DELAY = float(os.getenv("NADO_RATE_LIMIT_DELAY", "0.5"))
 
     @classmethod
     def get_rate_limit_delay(cls) -> float:
-        """Minimum delay between orders to respect rate limits"""
-        if cls.USE_SPOT_LEVERAGE:
-            return 0.12  # ~8 orders/sec to be safe (600/min = 10/sec)
-        return 2.2  # ~27 orders/min to be safe (30/min limit)
+        """Minimum delay between orders"""
+        return cls.RATE_LIMIT_DELAY
 
     # Telegram Notifications
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
