@@ -14,7 +14,7 @@ from nado_protocol.client import create_nado_client, NadoClient, NadoClientMode
 from nado_protocol.engine_client.types.execute import PlaceMarketOrderParams
 from nado_protocol.utils.execute import MarketOrderParams
 from nado_protocol.utils.subaccount import SubaccountParams
-from nado_protocol.utils.math import to_x18, from_x18
+from nado_protocol.utils.math import to_x18, from_x18, round_x18
 
 from src.config import Config
 
@@ -83,6 +83,9 @@ class TradingEngine:
         # Subaccount sender hex
         self._sender_hex: Optional[str] = None
 
+        # Product size increments cache (product_id -> size_increment as int)
+        self._size_increments: Dict[int, int] = {}
+
     def _get_client_mode(self) -> NadoClientMode:
         """Map config network to SDK mode"""
         if Config.NETWORK == "mainnet":
@@ -130,6 +133,9 @@ class TradingEngine:
         logger.info(f"Subaccount USDT0 balance: ${usdt_balance:,.2f}")
         logger.info(f"Health (initial): {health:.4f}")
 
+        # Load product size increments
+        await self._load_product_info()
+
         # Notify telegram
         if self.telegram:
             await self.telegram.send_message(
@@ -148,6 +154,30 @@ class TradingEngine:
         name_bytes = subaccount_name.encode('utf-8')
         name_hex = name_bytes.hex().ljust(24, '0')  # 12 bytes = 24 hex chars
         return "0x" + addr_hex + name_hex
+
+    async def _load_product_info(self):
+        """Load size_increment for all trading products"""
+        logger.info("Loading product info...")
+
+        # Get all products from engine
+        all_products = self.client.market.get_all_engine_markets()
+
+        # Cache size_increment for perp products
+        for product in all_products.perp_products:
+            product_id = int(product.product_id)
+            size_increment = int(product.book_info.size_increment)
+            min_size = int(product.book_info.min_size)
+            self._size_increments[product_id] = size_increment
+
+            if product_id in Config.TRADING_PRODUCTS:
+                symbol = Config.get_product_symbol(product_id)
+                # Convert to human-readable
+                size_inc_human = from_x18(size_increment)
+                min_size_human = from_x18(min_size)
+                logger.info(
+                    f"  {symbol}: size_increment={size_inc_human}, "
+                    f"min_size={min_size_human}"
+                )
 
     def _get_usdt_balance(self, info) -> float:
         """Extract USDT balance from subaccount info"""
@@ -263,15 +293,39 @@ class TradingEngine:
         trade_size = trade_amount / current_price  # Base asset size
 
         direction = "LONG" if is_long else "SHORT"
-        logger.info(
-            f"Opening {direction} {symbol}: ${trade_amount:.2f} "
-            f"({trade_size:.6f} @ ${current_price:.2f})"
-        )
 
         # Open position using SDK
         try:
+            # Get size_increment for this product
+            size_increment = self._size_increments.get(product_id)
+            if not size_increment:
+                logger.error(f"No size_increment for product {product_id}")
+                return
+
             # Amount is positive for long, negative for short
-            amount_x18 = to_x18(trade_size if is_long else -trade_size)
+            raw_amount_x18 = to_x18(trade_size if is_long else -trade_size)
+
+            # Round amount to size_increment (must be divisible)
+            amount_x18 = round_x18(abs(raw_amount_x18), size_increment)
+            if not is_long:
+                amount_x18 = -amount_x18
+
+            # Skip if amount is zero after rounding
+            if amount_x18 == 0:
+                logger.warning(f"Amount too small for {symbol}, skipping")
+                return
+
+            # Log with details
+            rounded_size = from_x18(abs(amount_x18))
+            logger.info(
+                f"Opening {direction} {symbol}: ${trade_amount:.2f} "
+                f"({rounded_size:.6f} @ ${current_price:.2f})"
+            )
+            logger.debug(
+                f"  raw_amount_x18={raw_amount_x18}, "
+                f"size_increment={size_increment}, "
+                f"rounded_amount_x18={amount_x18}"
+            )
 
             # Build subaccount params
             subaccount = SubaccountParams(
@@ -297,20 +351,20 @@ class TradingEngine:
 
             self.stats.total_trades += 1
             self.stats.successful_trades += 1
-            self.stats.total_volume_usd += trade_amount
+            self.stats.total_volume_usd += rounded_size * current_price
 
-            # Track position
+            # Track position with actual rounded size
             digest = result.data.digest if result.data else None
             self.positions[product_id] = ActivePosition(
                 product_id=product_id,
                 is_long=is_long,
-                amount=trade_size,
+                amount=rounded_size,
                 entry_price=current_price,
                 open_time=time.time(),
                 order_digest=digest
             )
 
-            logger.info(f"Opened {direction} {symbol} successfully")
+            logger.info(f"Opened {direction} {symbol} successfully (digest: {digest})")
 
         except Exception as e:
             logger.error(f"Failed to open {direction} {symbol}: {e}")
