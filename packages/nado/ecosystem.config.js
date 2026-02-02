@@ -1,9 +1,9 @@
 module.exports = {
   apps: [{
     name: 'nado-bot',
-    interpreter: '/home/user/lighter-volume/packages/nado/venv/bin/python',
+    interpreter: '/home/user/nado-volume/packages/nado/venv/bin/python',
     script: 'main.py',
-    cwd: '/home/user/lighter-volume/packages/nado',
+    cwd: '/home/user/nado-volume/packages/nado',
     autorestart: true,
     max_restarts: 10,
     min_uptime: '10s',
